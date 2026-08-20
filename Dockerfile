@@ -4,7 +4,8 @@ FROM python:3.11-slim
 # Prevent Python from writing .pyc files & enable unbuffered stdout/stderr logging
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PORT=8080
+    PORT=8080 \
+    FORWARDED_ALLOW_IPS=*
 
 WORKDIR /app
 
@@ -27,5 +28,5 @@ COPY . .
 # Expose port
 EXPOSE 8080
 
-# Start Uvicorn listening on Cloud Run's dynamic $PORT with proxy-headers enabled
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips='*'"]
+# Start FastAPI server via main.py
+CMD ["python", "main.py"]
