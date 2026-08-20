@@ -9,9 +9,10 @@ from models.resident_report import ResidentReportCreate, ResidentReportAction
 router = APIRouter(prefix="/api/resident-reports", tags=["Resident Reports"])
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
 async def list_resident_reports(
-    current_user: Annotated[dict, Depends(require_roles("admin", "barangay_official"))]
+    current_user: Annotated[dict, Depends(require_roles("admin", "barangay_official", "resident"))]
 ):
     """List resident-submitted reports. Barangay officials see their own barangay only."""
     sb = get_supabase()
@@ -19,11 +20,14 @@ async def list_resident_reports(
 
     if current_user["role"] == "barangay_official" and current_user.get("barangay"):
          query = query.eq("barangay", current_user["barangay"])
+    elif current_user["role"] == "resident":
+         query = query.eq("submitted_by", current_user["id"])
 
     result = query.execute()
     return {"success": True, "data": result.data or []}
 
 
+@router.post("", include_in_schema=False)
 @router.post("/")
 async def submit_resident_report(
     body: ResidentReportCreate,

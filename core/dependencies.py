@@ -7,6 +7,7 @@ from core.security import decode_access_token
 from core.database import get_supabase
 
 security_scheme = HTTPBearer()
+security_scheme_optional = HTTPBearer(auto_error=False)
 
 # ---------------------------------------------------------------------------
 # Valid roles (keep in sync with DB check constraint)
@@ -58,6 +59,26 @@ async def get_current_user(
         )
 
     return user
+
+
+async def get_optional_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security_scheme_optional)] = None,
+) -> dict | None:
+    """Decode bearer token if provided; return None without error if unauthenticated."""
+    if not credentials or not credentials.credentials:
+        return None
+    payload = decode_access_token(credentials.credentials)
+    if payload is None:
+        return None
+    user_id = payload.get("sub")
+    if not user_id:
+        return None
+    try:
+        sb = get_supabase()
+        result = sb.table("users").select("*").eq("id", user_id).single().execute()
+        return result.data if result.data and result.data.get("is_active") else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------

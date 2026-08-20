@@ -8,24 +8,24 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install system build dependencies required for compiling crypto/bcrypt binaries
+# Install system build dependencies required for compiling binary extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency manifests first to leverage Docker layer caching
+# Copy dependency manifests
 COPY requirements.txt .
 
 # Install Python production dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy local application code into container
+# Copy application source code
 COPY . .
 
-# Google Cloud Run default port
+# Expose port
 EXPOSE 8080
 
-# Run FastAPI with Uvicorn using Cloud Run's dynamic $PORT
-CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
+# Start Uvicorn listening on Cloud Run's dynamic $PORT with proxy-headers enabled
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips='*'"]

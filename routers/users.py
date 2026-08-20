@@ -10,6 +10,7 @@ from models.user import UserCreate, UserUpdate
 router = APIRouter(prefix="/api/users", tags=["Users"])
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
 async def list_users(
     _admin: Annotated[dict, Depends(require_admin)],
@@ -26,6 +27,7 @@ async def list_users(
     return {"success": True, "data": result.data or []}
 
 
+@router.post("", include_in_schema=False)
 @router.post("/")
 async def create_user(
     body: UserCreate,

@@ -9,6 +9,7 @@ from models.inspection import InspectionCreate, InspectionAssign, InspectionComp
 router = APIRouter(prefix="/api/inspections", tags=["Inspections"])
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
 async def list_inspections(current_user: Annotated[dict, Depends(get_current_user)]):
     """List inspection requests. Filtered by role."""
@@ -16,8 +17,8 @@ async def list_inspections(current_user: Annotated[dict, Depends(get_current_use
     query = sb.table("inspection_requests").select("*").order("created_at", desc=True)
 
     if current_user["role"] == "sanitization_inspector":
-        # Inspectors see assigned requests
-        query = query.eq("assigned_to", current_user["id"])
+        # Inspectors see assigned requests or unassigned in need of field test
+        query = query.or_(f"assigned_to.eq.{current_user['id']},assigned_to.is.null")
     elif current_user["role"] == "barangay_official":
         # Officials see requests in their barangay
         if current_user.get("barangay"):
@@ -30,6 +31,7 @@ async def list_inspections(current_user: Annotated[dict, Depends(get_current_use
     return {"success": True, "data": result.data or []}
 
 
+@router.post("", include_in_schema=False)
 @router.post("/")
 async def create_inspection(
     body: InspectionCreate,

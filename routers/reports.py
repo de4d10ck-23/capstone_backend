@@ -11,11 +11,12 @@ from models.report import ReportGenerate
 router = APIRouter(prefix="/api/reports", tags=["Reports"])
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
 async def list_reports(
-    current_user: Annotated[dict, Depends(require_admin_cho_inspector)]
+    current_user: Annotated[dict, Depends(require_staff)]
 ):
-    """List generated reports. CHO can only view/download."""
+    """List generated reports."""
     sb = get_supabase()
     result = sb.table("reports").select("*").order("created_at", desc=True).execute()
     return {"success": True, "data": result.data or []}

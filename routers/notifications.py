@@ -3,24 +3,26 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.database import get_supabase
-from core.dependencies import get_current_user, require_staff
+from core.dependencies import get_current_user, get_optional_user, require_staff
 from models.notification import NotificationCreate
 
 router = APIRouter(prefix="/api/notifications", tags=["Notifications"])
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
-async def list_notifications(current_user: Annotated[dict, Depends(get_current_user)]):
+async def list_notifications(
+    barangay: str | None = None,
+    current_user: Annotated[dict | None, Depends(get_optional_user)] = None,
+):
     """Get notifications for the current user based on their role and barangay."""
     sb = get_supabase()
-    
-    # In a real app, you'd filter by target_roles and barangay.
-    # For simplicity, we just fetch all for now, or filter if specified.
     query = sb.table("notifications").select("*").order("created_at", desc=True)
-    
-    # Example filtering (needs adjustment based on exact DB schema)
-    # if current_user["role"] == "resident":
-    #    query = query.contains("target_roles", ["resident"]).eq("barangay", current_user.get("barangay"))
+
+    if current_user and current_user.get("role") == "barangay_official" and current_user.get("barangay"):
+        query = query.or_(f"barangay.eq.{current_user['barangay']},barangay.is.null")
+    elif barangay:
+        query = query.or_(f"barangay.eq.{barangay},barangay.is.null")
         
     result = query.execute()
     return {"success": True, "data": result.data or []}

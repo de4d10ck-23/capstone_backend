@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 
 from core.database import get_supabase
-from core.dependencies import get_current_user, require_admin_or_inspector
+from core.dependencies import get_current_user, get_optional_user, require_admin_or_inspector
 from core.storage import upload_to_supabase, delete_from_supabase
 from models.water_location import WaterLocationCreate, WaterLocationUpdate
 
@@ -13,15 +13,21 @@ router = APIRouter(prefix="/api/water-locations", tags=["Water Locations"])
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
-async def list_water_locations(current_user: Annotated[dict, Depends(get_current_user)]):
-    """Get all water locations. Barangay officials see only their barangay."""
+async def list_water_locations(
+    barangay: str | None = None,
+    current_user: Annotated[dict | None, Depends(get_optional_user)] = None,
+):
+    """Get all water locations with optional barangay filtering."""
     sb = get_supabase()
     query = sb.table("water_locations").select("*")
 
-    # Barangay officials only see their barangay
-    if current_user["role"] == "barangay_official" and current_user.get("barangay"):
+    # Scoped filtering for barangay official or query parameter
+    if current_user and current_user.get("role") == "barangay_official" and current_user.get("barangay"):
         query = query.eq("barangay", current_user["barangay"])
+    elif barangay:
+        query = query.eq("barangay", barangay)
 
     result = query.order("created_at", desc=True).execute()
     return {"success": True, "data": result.data or []}
