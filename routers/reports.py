@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from core.database import get_supabase
-from core.dependencies import get_current_user, require_admin_or_inspector, require_admin_cho_inspector
+from core.dependencies import get_current_user, require_admin_or_inspector, require_admin_cho_inspector, require_staff
 from models.report import ReportGenerate
 
 router = APIRouter(prefix="/api/reports", tags=["Reports"])
