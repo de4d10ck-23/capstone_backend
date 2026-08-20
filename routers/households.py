@@ -10,6 +10,8 @@ router = APIRouter(prefix="/api/households", tags=["Households"])
 
 @router.get("", include_in_schema=False)
 @router.get("/")
+@router.get("/spatial")
+@router.get("/spatial/")
 async def list_households(
     _user: Annotated[dict, Depends(require_admin_cho_inspector)],
 ):
