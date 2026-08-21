@@ -30,7 +30,18 @@ async def list_water_locations(
         query = query.eq("barangay", barangay)
 
     result = query.order("created_at", desc=True).execute()
-    return {"success": True, "data": result.data or []}
+    locations = []
+    for loc in (result.data or []):
+        name_val = loc.get("full_name") or loc.get("name") or "Water Station"
+        loc["name"] = name_val
+        loc["full_name"] = name_val
+        loc["source_type"] = loc.get("source_type") or loc.get("type") or "deep_well"
+        loc["type"] = loc.get("type") or loc.get("source_type") or "deep_well"
+        if not loc.get("status"):
+            loc["status"] = _compute_water_status(loc)
+        locations.append(loc)
+
+    return {"success": True, "data": locations}
 
 
 @router.get("/public")
@@ -47,8 +58,12 @@ async def list_public_water_locations():
     # Add computed water_status
     locations = []
     for loc in (result.data or []):
+        name_val = loc.get("full_name") or loc.get("name") or "Water Station"
+        loc["name"] = name_val
+        loc["full_name"] = name_val
         status = _compute_water_status(loc)
         loc["water_status"] = status
+        loc["status"] = status
         locations.append(loc)
 
     return {"success": True, "data": locations}
@@ -69,6 +84,7 @@ async def get_water_location(
     return {"success": True, "data": result.data}
 
 
+@router.post("", include_in_schema=False)
 @router.post("/")
 async def create_water_location(
     body: WaterLocationCreate,
@@ -79,38 +95,52 @@ async def create_water_location(
 
     # Validate Maasin bounds
     if not (10.0 <= body.latitude <= 10.3) or not (124.7 <= body.longitude <= 125.1):
-        raise HTTPException(status_code=400, detail="Coordinates must be within Maasin City bounds")
+        raise HTTPException(status_code=400, detail="Coordinates must be within Maasin City bounds (Latitude: 10.0 - 10.3, Longitude: 124.7 - 125.1)")
 
     # Normalize bacteriological_exam
     exam = (body.bacteriological_exam or "").strip().lower()
     if exam and exam not in ("passed", "failed", "untested"):
         exam = "untested"
 
+    full_name = (body.full_name or body.name or "Water Station").strip()
+    status_val = (body.status or "safe").strip().lower()
+    if not exam or exam == "untested":
+        exam = "passed" if status_val == "safe" else "failed"
+
+    notes_val = body.notes or body.description or body.remarks or None
+
     new_loc = {
-        "full_name": body.full_name.strip(),
+        "full_name": full_name,
         "barangay": body.barangay,
         "latitude": body.latitude,
         "longitude": body.longitude,
-        "coliform_bacteria": body.coliform_bacteria,
-        "e_coli": body.e_coli,
-        "bacteriological_exam": exam or "untested",
+        "coliform_bacteria": body.coliform_bacteria if body.coliform_bacteria is not None else ((body.coliform_count or 0) > 0),
+        "e_coli": body.e_coli if body.e_coli is not None else ((body.e_coli_count or 0) > 0),
+        "bacteriological_exam": exam,
         "image_url": body.image_url,
-        "sample_date": body.sample_date,
-        "sample_time": body.sample_time,
+        "sample_date": body.sample_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "sample_time": body.sample_time or datetime.now(timezone.utc).strftime("%H:%M:%S"),
         "created_by": current_user["id"],
         "inspector_id": current_user["id"] if current_user["role"] == "sanitization_inspector" else None,
-        "status": "pending",
-        "notes": body.notes,
+        "status": status_val,
+        "notes": notes_val,
     }
 
-    result = sb.table("water_locations").insert(new_loc).execute()
+    try:
+        result = sb.table("water_locations").insert(new_loc).execute()
+    except Exception as e:
+        # Fallback if image_url or some optional column doesn't exist
+        cleaned = {k: v for k, v in new_loc.items() if v is not None}
+        result = sb.table("water_locations").insert(cleaned).execute()
+
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to create water location")
 
-    return {"success": True, "message": "Water location created", "data": result.data[0]}
+    return {"success": True, "message": "Water location created successfully", "data": result.data[0]}
 
 
-@router.put("/{location_id}")
+@router.put("/{location_id}", include_in_schema=False)
+@router.put("/{location_id}/")
 async def update_water_location(
     location_id: str,
     body: WaterLocationUpdate,
@@ -135,6 +165,21 @@ async def update_water_location(
         elif raw == "":
             update_data["bacteriological_exam"] = None
 
+    if "name" in update_data and not update_data.get("full_name"):
+        update_data["full_name"] = update_data["name"]
+
+    if "description" in update_data and not update_data.get("notes"):
+        update_data["notes"] = update_data["description"]
+
+    # Clean non-column fields if present
+    update_data.pop("name", None)
+    update_data.pop("description", None)
+    update_data.pop("source_type", None)
+    update_data.pop("type", None)
+    update_data.pop("remarks", None)
+    update_data.pop("coliform_count", None)
+    update_data.pop("e_coli_count", None)
+
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     result = sb.table("water_locations").update(update_data).eq("id", location_id).execute()
@@ -145,7 +190,8 @@ async def update_water_location(
     return {"success": True, "message": "Water location updated", "data": result.data[0]}
 
 
-@router.delete("/{location_id}")
+@router.delete("/{location_id}", include_in_schema=False)
+@router.delete("/{location_id}/")
 async def delete_water_location(
     location_id: str,
     current_user: Annotated[dict, Depends(require_admin_or_inspector)],
@@ -165,7 +211,8 @@ async def delete_water_location(
     return {"success": True, "message": "Water location deleted"}
 
 
-@router.post("/upload-image")
+@router.post("/upload-image", include_in_schema=False)
+@router.post("/upload-image/")
 async def upload_image(
     file: UploadFile = File(...),
     current_user: Annotated[dict, Depends(require_admin_or_inspector)] = None,

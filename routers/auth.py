@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, status, Depends
 from core.database import get_supabase
 from core.security import hash_password, verify_password, create_access_token
 from core.dependencies import get_current_user
+from core.constants import validate_and_normalize_barangay
 from models.user import LoginRequest, RegisterRequest, TokenResponse
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
@@ -59,6 +60,12 @@ async def register(body: RegisterRequest):
         if existing_email.data:
             raise HTTPException(status_code=400, detail="Email already registered")
 
+    # Validate barangay
+    try:
+        normalized_barangay = validate_and_normalize_barangay(body.barangay)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     # Create user as resident
     new_user = {
         "full_name": body.full_name.strip(),
@@ -66,7 +73,7 @@ async def register(body: RegisterRequest):
         "email": body.email,
         "password_hash": hash_password(body.password),
         "role": "resident",
-        "barangay": body.barangay,
+        "barangay": normalized_barangay,
         "is_active": True,
     }
 

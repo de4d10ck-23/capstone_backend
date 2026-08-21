@@ -5,10 +5,13 @@ from typing import Optional
 class ResidentReportCreate(BaseModel):
     title: str = Field(..., min_length=1)
     description: str = Field(..., min_length=1)
-    type: str = "concern"  # concern | new_water_source
+    type: Optional[str] = "concern"
+    category: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     barangay: Optional[str] = None
+    image_url: Optional[str] = None
+    photo_url: Optional[str] = None
 
 
 class ResidentReportAction(BaseModel):

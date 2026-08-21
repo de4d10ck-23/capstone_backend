@@ -4,7 +4,8 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 
 from core.database import get_supabase
 from core.security import hash_password
-from core.dependencies import require_admin, VALID_ROLES
+from core.dependencies import require_admin, require_staff, VALID_ROLES
+from core.constants import validate_and_normalize_barangay
 from models.user import UserCreate, UserUpdate
 
 router = APIRouter(prefix="/api/users", tags=["Users"])
@@ -13,7 +14,7 @@ router = APIRouter(prefix="/api/users", tags=["Users"])
 @router.get("", include_in_schema=False)
 @router.get("/")
 async def list_users(
-    _admin: Annotated[dict, Depends(require_admin)],
+    _user: Annotated[dict, Depends(require_staff)],
     role: Optional[str] = Query(None),
 ):
     """List all users. Optionally filter by role. Admin only."""
@@ -37,6 +38,14 @@ async def create_user(
     if body.role not in VALID_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {', '.join(VALID_ROLES)}")
 
+    # Validate barangay if role is resident or barangay_official
+    assigned_barangay = None
+    if body.role in ("resident", "barangay_official"):
+        try:
+            assigned_barangay = validate_and_normalize_barangay(body.barangay)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     sb = get_supabase()
 
     # Check username uniqueness
@@ -56,7 +65,7 @@ async def create_user(
         "email": body.email,
         "password_hash": hash_password(body.password),
         "role": body.role,
-        "barangay": body.barangay,
+        "barangay": assigned_barangay,
         "is_active": body.is_active,
     }
 
@@ -99,6 +108,16 @@ async def update_user(
 
     if "role" in update_data and update_data["role"] not in VALID_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {', '.join(VALID_ROLES)}")
+
+    # Validate and normalize barangay
+    if "barangay" in update_data:
+        if update_data["barangay"]:
+            try:
+                update_data["barangay"] = validate_and_normalize_barangay(update_data["barangay"])
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+        else:
+            update_data["barangay"] = None
 
     result = sb.table("users").update(update_data).eq("id", user_id).execute()
 

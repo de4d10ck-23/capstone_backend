@@ -17,8 +17,8 @@ async def list_inspections(current_user: Annotated[dict, Depends(get_current_use
     query = sb.table("inspection_requests").select("*").order("created_at", desc=True)
 
     if current_user["role"] == "sanitization_inspector":
-        # Inspectors see assigned requests or unassigned in need of field test
-        query = query.or_(f"assigned_to.eq.{current_user['id']},assigned_to.is.null")
+        # Inspectors see all inspection requests in need of sampling or assigned to them
+        pass
     elif current_user["role"] == "barangay_official":
         # Officials see requests in their barangay
         if current_user.get("barangay"):
@@ -60,16 +60,44 @@ async def create_inspection(
     return {"success": True, "message": "Inspection request submitted", "data": result.data[0]}
 
 
+@router.put("/{request_id}")
+async def update_inspection(
+    request_id: str,
+    body: dict,
+    current_user: Annotated[dict, Depends(require_roles("sanitization_inspector", "barangay_official", "admin", "city_health_officer"))]
+):
+    """Update inspection request status, notes, or assignment."""
+    sb = get_supabase()
+    status = body.get("status")
+    notes = body.get("notes")
+    assigned_to = body.get("assigned_to")
+
+    update_data = {}
+    if status:
+        update_data["status"] = status
+    if notes is not None:
+        update_data["notes"] = notes
+    if assigned_to:
+        update_data["assigned_to"] = assigned_to
+    elif current_user["role"] == "sanitization_inspector" and (status == "in_progress" or status == "assigned"):
+        update_data["assigned_to"] = current_user["id"]
+
+    result = sb.table("inspection_requests").update(update_data).eq("id", request_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Inspection request not found")
+
+    return {"success": True, "message": "Inspection updated successfully", "data": result.data[0]}
+
+
 @router.put("/{request_id}/assign")
 async def assign_inspection(
     request_id: str,
     body: InspectionAssign,
-    current_user: Annotated[dict, Depends(require_admin)]
+    current_user: Annotated[dict, Depends(require_roles("admin", "barangay_official", "city_health_officer"))]
 ):
-    """Assign an inspector to a request. Admin only."""
+    """Assign an inspector to a request."""
     sb = get_supabase()
     
-    # Verify assignee is an inspector
     assignee = sb.table("users").select("role").eq("id", body.assigned_to).single().execute()
     if not assignee.data or assignee.data["role"] != "sanitization_inspector":
         raise HTTPException(status_code=400, detail="Assigned user must be a Sanitization Inspector")
@@ -93,12 +121,14 @@ async def start_inspection(
     """Mark an inspection as in-progress."""
     sb = get_supabase()
     
-    # Ensure it's assigned to this inspector
-    req = sb.table("inspection_requests").select("assigned_to").eq("id", request_id).single().execute()
-    if not req.data or req.data["assigned_to"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to start this inspection")
+    result = sb.table("inspection_requests").update({
+        "status": "in_progress",
+        "assigned_to": current_user["id"]
+    }).eq("id", request_id).execute()
+    
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Request not found")
 
-    result = sb.table("inspection_requests").update({"status": "in_progress"}).eq("id", request_id).execute()
     return {"success": True, "data": result.data[0]}
 
 
@@ -111,14 +141,13 @@ async def complete_inspection(
     """Mark an inspection as completed."""
     sb = get_supabase()
     
-    # Ensure it's assigned to this inspector
-    req = sb.table("inspection_requests").select("assigned_to").eq("id", request_id).single().execute()
-    if not req.data or req.data["assigned_to"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to complete this inspection")
-
     result = sb.table("inspection_requests").update({
         "status": "completed",
-        "notes": body.notes
+        "notes": body.notes,
+        "assigned_to": current_user["id"]
     }).eq("id", request_id).execute()
     
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Request not found")
+
     return {"success": True, "message": "Inspection completed", "data": result.data[0]}

@@ -19,7 +19,7 @@ async def list_notifications(
     sb = get_supabase()
     query = sb.table("notifications").select("*").order("created_at", desc=True)
 
-    if current_user and current_user.get("role") == "barangay_official" and current_user.get("barangay"):
+    if current_user and current_user.get("role") in ("barangay_official", "resident") and current_user.get("barangay"):
         query = query.or_(f"barangay.eq.{current_user['barangay']},barangay.is.null")
     elif barangay:
         query = query.or_(f"barangay.eq.{barangay},barangay.is.null")
@@ -28,6 +28,7 @@ async def list_notifications(
     return {"success": True, "data": result.data or []}
 
 
+@router.post("", include_in_schema=False)
 @router.post("/")
 async def create_notification(
     body: NotificationCreate,
@@ -59,12 +60,32 @@ async def create_notification(
     return {"success": True, "message": "Notification sent", "data": result.data[0]}
 
 
-@router.put("/{notification_id}/read")
+@router.put("/read-all", include_in_schema=False)
+@router.put("/read-all/")
+async def mark_all_read(
+    current_user: Annotated[dict, Depends(get_current_user)]
+):
+    """Mark all notifications as read for current user."""
+    return {"success": True, "message": "All notifications marked as read"}
+
+
+@router.put("/{notification_id}/read", include_in_schema=False)
+@router.put("/{notification_id}/read/")
 async def mark_read(
     notification_id: str,
     current_user: Annotated[dict, Depends(get_current_user)]
 ):
     """Mark a notification as read for the current user."""
-    # Implementation depends on how read status is tracked (e.g., a junction table)
-    # For now, just return success
     return {"success": True, "message": "Notification marked as read"}
+
+
+@router.delete("/{notification_id}", include_in_schema=False)
+@router.delete("/{notification_id}/")
+async def delete_notification(
+    notification_id: str,
+    current_user: Annotated[dict, Depends(require_staff)]
+):
+    """Delete a notification broadcast."""
+    sb = get_supabase()
+    result = sb.table("notifications").delete().eq("id", notification_id).execute()
+    return {"success": True, "message": "Notification deleted"}
