@@ -69,6 +69,7 @@ async def list_public_water_locations():
     return {"success": True, "data": locations}
 
 
+
 @router.get("/{location_id}")
 async def get_water_location(
     location_id: str,
@@ -126,12 +127,7 @@ async def create_water_location(
         "notes": notes_val,
     }
 
-    try:
-        result = sb.table("water_locations").insert(new_loc).execute()
-    except Exception as e:
-        # Fallback if image_url or some optional column doesn't exist
-        cleaned = {k: v for k, v in new_loc.items() if v is not None}
-        result = sb.table("water_locations").insert(cleaned).execute()
+    result = sb.table("water_locations").insert(new_loc).execute()
 
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to create water location")
@@ -188,6 +184,7 @@ async def update_water_location(
         raise HTTPException(status_code=404, detail="Water location not found")
 
     return {"success": True, "message": "Water location updated", "data": result.data[0]}
+
 
 
 @router.delete("/{location_id}", include_in_schema=False)

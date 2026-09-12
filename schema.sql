@@ -36,6 +36,10 @@ CREATE TABLE water_locations (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW())
 );
 
+-- Migration helper if table already exists:
+-- ALTER TABLE water_locations DROP COLUMN IF EXISTS boundary_radius;
+
+
 -- Table: households (for heatmap data)
 CREATE TABLE households (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -135,3 +139,19 @@ BEGIN
     LIMIT 5000;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Table: contamination_hazards (Spatial Points, River Polylines, Agricultural Polygons)
+CREATE TABLE IF NOT EXISTS contamination_hazards (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name TEXT NOT NULL,
+    hazard_type TEXT NOT NULL CHECK (hazard_type IN ('latrine', 'septic_tank', 'piggery', 'river', 'stream', 'drainage', 'agricultural_land', 'farmland', 'other')),
+    geometry_type TEXT NOT NULL CHECK (geometry_type IN ('Point', 'LineString', 'Polygon')),
+    coordinates JSONB NOT NULL,
+    barangay TEXT,
+    risk_level TEXT DEFAULT 'high' CHECK (risk_level IN ('high', 'medium', 'low')),
+    notes TEXT,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW())
+);
+

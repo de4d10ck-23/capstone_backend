@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from routers import (
     auth, users, water_locations, households, analytics,
-    reports, notifications, inspections, resident_reports, forecast, map
+    reports, notifications, inspections, resident_reports, forecast, map, hazards
 )
 
 app = FastAPI(title="WaterWatch API", version="2.0.0")
@@ -35,6 +35,7 @@ app.include_router(inspections.router)
 app.include_router(resident_reports.router)
 app.include_router(forecast.router)
 app.include_router(map.router)
+app.include_router(hazards.router)
 
 if __name__ == "__main__":
     import uvicorn
@@ -42,6 +43,7 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=settings.PORT,
+        reload=True,
         proxy_headers=True,
         forwarded_allow_ips="*",
     )
