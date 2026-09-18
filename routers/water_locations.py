@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated
 from datetime import datetime, timezone
 
@@ -7,6 +8,8 @@ from core.database import get_supabase
 from core.dependencies import get_current_user, get_optional_user, require_admin_or_inspector
 from core.storage import upload_to_supabase, delete_from_supabase
 from models.water_location import WaterLocationCreate, WaterLocationUpdate
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/water-locations", tags=["Water Locations"])
 
@@ -50,7 +53,7 @@ async def list_public_water_locations():
     sb = get_supabase()
     result = (
         sb.table("water_locations")
-        .select("id, full_name, barangay, latitude, longitude, coliform_bacteria, e_coli, bacteriological_exam, sample_date")
+        .select("id, full_name, barangay, latitude, longitude, coliform_bacteria, e_coli, bacteriological_exam, sample_date, sample_time")
         .order("created_at", desc=True)
         .execute()
     )
@@ -83,6 +86,46 @@ async def get_water_location(
         raise HTTPException(status_code=404, detail="Water location not found")
 
     return {"success": True, "data": result.data}
+ 
+ 
+@router.get("/{location_id}/history")
+async def get_water_location_history(
+    location_id: str,
+    _user: Annotated[dict, Depends(get_current_user)],
+):
+    """Fetch status audit timeline logs for a water location."""
+    sb = get_supabase()
+    logs = []
+    try:
+        res = sb.table("water_status_logs").select("*").eq("location_id", location_id).order("recorded_at", desc=False).execute()
+        logs = res.data or []
+    except Exception as exc:
+        logger.warning(f"Error fetching water_status_logs: {exc}")
+        logs = []
+
+    # If no logs exist yet, build baseline entry from water_locations
+    if not logs:
+        try:
+            loc = sb.table("water_locations").select("*").eq("id", location_id).single().execute()
+            if loc.data:
+                s_date = loc.data.get("sample_date")
+                s_time = loc.data.get("sample_time") or "12:00:00"
+                rec_at = f"{s_date}T{s_time}Z" if s_date else (loc.data.get("created_at") or loc.data.get("updated_at") or datetime.now(timezone.utc).isoformat())
+                logs = [{
+                    "id": f"baseline-{location_id}",
+                    "location_id": location_id,
+                    "status": loc.data.get("status") or "safe",
+                    "previous_status": None,
+                    "bacteriological_exam": loc.data.get("bacteriological_exam") or "passed",
+                    "coliform_count": 1 if loc.data.get("coliform_bacteria") else 0,
+                    "e_coli_count": 1 if loc.data.get("e_coli") else 0,
+                    "notes": "Initial water source registration",
+                    "recorded_at": rec_at
+                }]
+        except Exception as exc:
+            logger.warning(f"Error generating baseline status log: {exc}")
+
+    return {"success": True, "data": logs}
 
 
 @router.post("", include_in_schema=False)
@@ -132,6 +175,25 @@ async def create_water_location(
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to create water location")
 
+    # Record initial status in water_status_logs
+    try:
+        new_id = result.data[0]["id"]
+        s_date = body.sample_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        s_time = body.sample_time or datetime.now(timezone.utc).strftime("%H:%M:%S")
+        sb.table("water_status_logs").insert({
+            "location_id": new_id,
+            "status": status_val,
+            "previous_status": None,
+            "bacteriological_exam": body.bacteriological_exam or ("passed" if status_val == "safe" else "failed"),
+            "coliform_count": body.coliform_count if body.coliform_count is not None else (1 if body.coliform_bacteria else 0),
+            "e_coli_count": body.e_coli_count if body.e_coli_count is not None else (1 if body.e_coli else 0),
+            "notes": notes_val or "Initial water source registration",
+            "recorded_by": current_user["id"],
+            "recorded_at": f"{s_date}T{s_time}Z",
+        }).execute()
+    except Exception as log_exc:
+        logger.warning(f"Could not record initial water status log: {log_exc}")
+
     return {"success": True, "message": "Water location created successfully", "data": result.data[0]}
 
 
@@ -144,6 +206,13 @@ async def update_water_location(
 ):
     """Update a water location. Admin or Inspector only."""
     sb = get_supabase()
+
+    # Fetch existing state for transition audit
+    existing = None
+    try:
+        existing = sb.table("water_locations").select("*").eq("id", location_id).single().execute()
+    except Exception as fetch_err:
+        logger.warning(f"Could not fetch existing water location: {fetch_err}")
 
     update_data = {k: v for k, v in body.model_dump().items() if v is not None}
 
@@ -182,6 +251,28 @@ async def update_water_location(
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Water location not found")
+
+    # Record status transition in water_status_logs audit trail
+    try:
+        old_status = existing.data.get("status") if existing and existing.data else None
+        new_status = update_data.get("status") or old_status or "safe"
+        s_date = update_data.get("sample_date") or (existing.data.get("sample_date") if existing and existing.data else None) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        s_time = update_data.get("sample_time") or (existing.data.get("sample_time") if existing and existing.data else None) or datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+        log_entry = {
+            "location_id": location_id,
+            "status": new_status,
+            "previous_status": old_status,
+            "bacteriological_exam": update_data.get("bacteriological_exam") or (existing.data.get("bacteriological_exam") if existing and existing.data else None),
+            "coliform_count": body.coliform_count if body.coliform_count is not None else (1 if update_data.get("coliform_bacteria") else 0),
+            "e_coli_count": body.e_coli_count if body.e_coli_count is not None else (1 if update_data.get("e_coli") else 0),
+            "notes": update_data.get("notes") or f"Status updated to {new_status}",
+            "recorded_by": current_user.get("id"),
+            "recorded_at": f"{s_date}T{s_time}Z",
+        }
+        sb.table("water_status_logs").insert(log_entry).execute()
+    except Exception as log_exc:
+        logger.warning(f"Could not record water status log: {log_exc}")
 
     return {"success": True, "message": "Water location updated", "data": result.data[0]}
 

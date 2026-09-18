@@ -4,10 +4,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from routers import (
     auth, users, water_locations, households, analytics,
-    reports, notifications, inspections, resident_reports, forecast, map, hazards
+    reports, notifications, inspections, resident_reports, forecast, map, hazards, weather
 )
 
 app = FastAPI(title="WaterWatch API", version="2.0.0")
+
+from services.heatmap_service import start_heatmap_scheduler, stop_heatmap_scheduler
+
+@app.on_event("startup")
+async def on_startup():
+    start_heatmap_scheduler()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    stop_heatmap_scheduler()
 
 # CORS Setup
 app.add_middleware(
@@ -36,6 +46,7 @@ app.include_router(resident_reports.router)
 app.include_router(forecast.router)
 app.include_router(map.router)
 app.include_router(hazards.router)
+app.include_router(weather.router)
 
 if __name__ == "__main__":
     import uvicorn

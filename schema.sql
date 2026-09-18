@@ -36,6 +36,23 @@ CREATE TABLE water_locations (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW())
 );
 
+-- Table: water_status_logs (Audit trail of safety status transitions & lab tests over time)
+CREATE TABLE IF NOT EXISTS water_status_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    location_id UUID NOT NULL REFERENCES water_locations(id) ON DELETE CASCADE,
+    status TEXT NOT NULL, -- 'safe', 'warning', 'undrinkable'
+    previous_status TEXT,
+    bacteriological_exam TEXT,
+    coliform_bacteria BOOLEAN,
+    e_coli BOOLEAN,
+    coliform_count INTEGER DEFAULT 0,
+    e_coli_count INTEGER DEFAULT 0,
+    notes TEXT,
+    recorded_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW())
+);
+CREATE INDEX IF NOT EXISTS idx_water_status_logs_loc_date ON water_status_logs(location_id, recorded_at ASC);
+
 -- Migration helper if table already exists:
 -- ALTER TABLE water_locations DROP COLUMN IF EXISTS boundary_radius;
 
@@ -155,3 +172,19 @@ CREATE TABLE IF NOT EXISTS contamination_hazards (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW())
 );
 
+-- Water Station Status Change Audit Logs
+CREATE TABLE IF NOT EXISTS water_status_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    location_id UUID NOT NULL REFERENCES water_locations(id) ON DELETE CASCADE,
+    status TEXT NOT NULL, -- 'safe', 'warning', 'undrinkable'
+    previous_status TEXT,
+    coliform_bacteria BOOLEAN,
+    e_coli BOOLEAN,
+    coliform_count INTEGER DEFAULT 0,
+    e_coli_count INTEGER DEFAULT 0,
+    bacteriological_exam TEXT,
+    notes TEXT,
+    recorded_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW())
+);
+CREATE INDEX IF NOT EXISTS idx_water_status_logs_location ON water_status_logs(location_id, recorded_at DESC);
