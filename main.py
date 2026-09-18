@@ -33,6 +33,7 @@ app.add_middleware(
 def root():
     return {"message": "WaterWatch API is running"}
 
+
 # Include Routers
 app.include_router(auth.router)
 app.include_router(users.router)

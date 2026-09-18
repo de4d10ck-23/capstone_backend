@@ -1,12 +1,74 @@
+import logging
 from typing import Annotated
+from pydantic import BaseModel
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.database import get_supabase
 from core.dependencies import get_current_user, get_optional_user, require_staff
 from models.notification import NotificationCreate
+from services.push_service import (
+    get_vapid_public_key,
+    save_push_subscription,
+    remove_push_subscription,
+    broadcast_push_notification,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/notifications", tags=["Notifications"])
+
+
+class PushSubscriptionRequest(BaseModel):
+    subscription: dict
+    user_id: str | None = None
+    barangay: str | None = None
+
+
+class PushUnsubscribeRequest(BaseModel):
+    endpoint: str
+
+
+@router.get("/vapid-public-key")
+async def get_vapid_key():
+    """Retrieve VAPID public key for frontend push subscription."""
+    return {"success": True, "publicKey": get_vapid_public_key()}
+
+
+@router.post("/subscribe")
+async def subscribe_device(body: PushSubscriptionRequest):
+    """Save a resident's push subscription token."""
+    saved = save_push_subscription(
+        subscription=body.subscription,
+        user_id=body.user_id,
+        barangay=body.barangay,
+    )
+    if not saved:
+        raise HTTPException(status_code=400, detail="Invalid push subscription payload")
+    return {"success": True, "message": "Device successfully registered for push alerts"}
+
+
+@router.post("/unsubscribe")
+async def unsubscribe_device(body: PushUnsubscribeRequest):
+    """Remove a resident's push subscription token."""
+    remove_push_subscription(body.endpoint)
+    return {"success": True, "message": "Device unsubscribed from push alerts"}
+
+
+@router.post("/test-push")
+async def send_test_push(
+    barangay: str | None = None,
+    current_user: Annotated[dict | None, Depends(get_optional_user)] = None,
+):
+    """Send an immediate test push notification to all subscribed devices."""
+    res = await broadcast_push_notification(
+        title="🔔 WaterWatch Alert Test",
+        message="Your device is successfully connected to Maasin City real-time water safety alerts!",
+        barangay=barangay,
+        url="/portal/notifications",
+        tag="test-push-notification",
+    )
+    return {"success": True, "message": "Test push broadcast dispatched", "details": res}
 
 
 @router.get("", include_in_schema=False)
@@ -34,7 +96,7 @@ async def create_notification(
     body: NotificationCreate,
     current_user: Annotated[dict, Depends(require_staff)] # Admin, Inspector, Brgy Official
 ):
-    """Create a new notification."""
+    """Create a new notification and automatically dispatch Web Push to residents."""
     # Enforce manuscript rules: Barangay Officials can only notify their own barangay's residents
     if current_user["role"] == "barangay_official":
         if body.barangay != current_user.get("barangay"):
@@ -57,7 +119,21 @@ async def create_notification(
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to create notification")
 
-    return {"success": True, "message": "Notification sent", "data": result.data[0]}
+    created_record = result.data[0]
+
+    # Automatically broadcast Web Push alerts to registered resident devices
+    try:
+        await broadcast_push_notification(
+            title=f"WaterWatch: {new_notif['title']}",
+            message=new_notif.get("message") or "New official water safety advisory has been posted.",
+            barangay=new_notif.get("barangay"),
+            url="/portal/notifications",
+            tag=f"advisory-{created_record.get('id', 'new')}",
+        )
+    except Exception as push_err:
+        logger.warning(f"Error dispatching Web Push alerts: {push_err}")
+
+    return {"success": True, "message": "Notification sent and pushed to residents", "data": created_record}
 
 
 @router.put("/read-all", include_in_schema=False)
