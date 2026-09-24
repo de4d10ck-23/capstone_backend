@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 
 from core.database import get_supabase
 from core.dependencies import get_current_user, require_roles
-from core.storage import upload_to_supabase
+from core.storage import upload_to_supabase, delete_from_supabase
 from models.resident_report import ResidentReportCreate, ResidentReportAction
 
 router = APIRouter(prefix="/api/resident-reports", tags=["Resident Reports"])
@@ -252,3 +252,47 @@ async def escalate_report(
         print("Auto-create inspection failed:", ex)
          
     return {"success": True, "message": "Report escalated to CHU", "data": report}
+
+
+@router.delete("/{report_id}", include_in_schema=False)
+@router.delete("/{report_id}")
+async def delete_resident_report(
+    report_id: str,
+    current_user: Annotated[dict, Depends(require_roles("resident", "admin"))]
+):
+    """Delete a pending resident report. Only the resident who submitted it (or an admin) can delete it."""
+    import re
+    sb = get_supabase()
+
+    # Fetch report to check ownership and status
+    res = sb.table("resident_reports").select("*").eq("id", report_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    report = res.data[0]
+
+    # Residents can only delete their own reports
+    if current_user["role"] == "resident" and str(report.get("submitted_by")) != str(current_user["id"]):
+        raise HTTPException(status_code=403, detail="You do not have permission to delete this report")
+
+    # Only pending reports can be deleted (unless admin)
+    status = (report.get("status") or "pending").lower()
+    if status != "pending" and current_user["role"] != "admin":
+        raise HTTPException(status_code=400, detail="Only pending concerns can be deleted")
+
+    # Try to delete associated photo if any
+    desc = report.get("description") or ""
+    img_url = report.get("image_url") or report.get("photo_url")
+    if not img_url:
+        match = re.search(r'\[(?:Attached )?Photo Proof:\s*(https?://[^\s\]]+)\]', desc, re.IGNORECASE)
+        if match:
+            img_url = match.group(1)
+    if img_url:
+        try:
+            await delete_from_supabase(img_url)
+        except Exception:
+            pass
+
+    # Delete from database
+    sb.table("resident_reports").delete().eq("id", report_id).execute()
+    return {"success": True, "message": "Report deleted successfully"}
