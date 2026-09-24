@@ -97,12 +97,13 @@ async def create_notification(
     current_user: Annotated[dict, Depends(require_staff)] # Admin, Inspector, Brgy Official
 ):
     """Create a new notification and automatically dispatch Web Push to residents."""
-    # Enforce manuscript rules: Barangay Officials can only notify their own barangay's residents
+    # Enforce manuscript rules: Barangay Officials can only notify their own barangay's residents or send critical escalations to officials
     if current_user["role"] == "barangay_official":
-        if body.barangay != current_user.get("barangay"):
+        if body.barangay and body.barangay != current_user.get("barangay"):
              raise HTTPException(status_code=403, detail="You can only send notifications to your own barangay.")
-        if body.target_roles and "resident" not in body.target_roles and len(body.target_roles) > 0:
-             raise HTTPException(status_code=403, detail="Barangay officials primarily notify residents.")
+        if body.target_roles and "resident" not in body.target_roles and len(body.target_roles) > 0 and body.type != "critical":
+             raise HTTPException(status_code=403, detail="Barangay officials primarily notify residents unless submitting a critical escalation.")
+
 
     sb = get_supabase()
     

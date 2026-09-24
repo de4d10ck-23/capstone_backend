@@ -25,17 +25,20 @@ async def list_reports(
 @router.post("/generate")
 async def generate_report(
     body: ReportGenerate,
-    current_user: Annotated[dict, Depends(require_admin_or_inspector)]
+    current_user: Annotated[dict, Depends(require_staff)]
 ):
-    """Generate a new report. Admin and Inspector only."""
+    """Generate a new report. Open to authorized staff."""
     sb = get_supabase()
 
+    report_type = body.report_type or body.type or "barangay_endorsement"
+    report_barangay = body.barangay or current_user.get("barangay")
+
     # In a real app, this would trigger a background task to generate a PDF/CSV.
-    # For now, we just create a record in the database.
+    # For now, we create a record in the database.
     new_report = {
         "title": body.title.strip(),
-        "type": body.type,
-        "barangay": body.barangay,
+        "type": report_type,
+        "barangay": report_barangay,
         "period_start": body.period_start,
         "period_end": body.period_end,
         "generated_by": current_user["id"],
@@ -46,6 +49,7 @@ async def generate_report(
     result = sb.table("reports").insert(new_report).execute()
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to generate report")
+
 
     return {"success": True, "message": "Report generated successfully", "data": result.data[0]}
 
