@@ -3,7 +3,7 @@ from typing import Optional
 
 
 class ResidentReportCreate(BaseModel):
-    title: str = Field(..., min_length=1)
+    title: Optional[str] = "Community Concern"
     description: str = Field(..., min_length=1)
     type: Optional[str] = "concern"
     category: Optional[str] = None

@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 
@@ -69,6 +69,17 @@ async def list_resident_reports(
         # Clean description for display
         item["clean_description"] = re.sub(r'\[(?:Attached )?Photo Proof:\s*https?://[^\s\]]+\]', '', desc, flags=re.IGNORECASE).strip()
 
+        # Map rejected status to done or dismissed for Done History
+        st = item.get("status")
+        rs = item.get("reason") or ""
+        if st in ("rejected", "done", "dismissed"):
+            if st == "done" or rs.startswith("[DONE]"):
+                item["status"] = "done"
+                item["reason"] = rs.replace("[DONE]", "").strip()
+            else:
+                item["status"] = "dismissed"
+                item["reason"] = rs.replace("[DISMISSED]", "").strip()
+
     return {"success": True, "data": data}
 
 
@@ -82,6 +93,8 @@ async def submit_resident_report(
     sb = get_supabase()
     
     report_type = body.category or body.type or "concern"
+    type_label = report_type.replace("_", " ").title()
+    report_title = (body.title or "").strip() or f"{type_label} Report"
     img_url = body.image_url or body.photo_url
     
     desc = body.description.strip()
@@ -89,7 +102,7 @@ async def submit_resident_report(
         desc = f"{desc}\n\n[Attached Photo Proof: {img_url}]"
 
     new_report = {
-        "title": body.title.strip(),
+        "title": report_title,
         "description": desc,
         "type": report_type,
         "latitude": body.latitude,
@@ -129,16 +142,49 @@ async def update_resident_report(
     update_data = {
         "actioned_by": current_user["id"]
     }
-    if status:
-        update_data["status"] = status
     if reason is not None:
         update_data["reason"] = reason
 
-    result = sb.table("resident_reports").update(update_data).eq("id", report_id).execute()
+    if status:
+        if status == "done":
+            done_reason = f"[DONE] {reason}" if reason else "[DONE]"
+            update_data["reason"] = done_reason
+            try:
+                test_payload = dict(update_data)
+                test_payload["status"] = "done"
+                result = sb.table("resident_reports").update(test_payload).eq("id", report_id).execute()
+            except Exception:
+                update_data["status"] = "rejected"
+                result = sb.table("resident_reports").update(update_data).eq("id", report_id).execute()
+        elif status == "dismissed":
+            dism_reason = f"[DISMISSED] {reason}" if reason else "[DISMISSED]"
+            update_data["reason"] = dism_reason
+            try:
+                test_payload = dict(update_data)
+                test_payload["status"] = "dismissed"
+                result = sb.table("resident_reports").update(test_payload).eq("id", report_id).execute()
+            except Exception:
+                update_data["status"] = "rejected"
+                result = sb.table("resident_reports").update(update_data).eq("id", report_id).execute()
+        else:
+            update_data["status"] = status
+            result = sb.table("resident_reports").update(update_data).eq("id", report_id).execute()
+    else:
+        result = sb.table("resident_reports").update(update_data).eq("id", report_id).execute()
+
     if not result.data:
         raise HTTPException(status_code=404, detail="Report not found")
     
     report = result.data[0]
+    st = report.get("status")
+    rs = report.get("reason") or ""
+    if st in ("rejected", "done", "dismissed"):
+        if st == "done" or rs.startswith("[DONE]"):
+            report["status"] = "done"
+            report["reason"] = rs.replace("[DONE]", "").strip()
+        else:
+            report["status"] = "dismissed"
+            report["reason"] = rs.replace("[DISMISSED]", "").strip()
 
     # If forwarded or escalated to CHU (Sanitization Inspector), auto-create inspection request
     if pass_to_inspector or status == "escalated":
@@ -158,10 +204,10 @@ async def update_resident_report(
         except Exception as ex:
             print("Auto-create inspection failed:", ex)
 
-    # If completed or resolved (e.g. registered into official registry by CHU), notify resident
-    if status in ("completed", "resolved"):
+    # If completed or resolved (e.g. marked done by brgy or registered into official registry by CHU), notify resident
+    if status in ("completed", "resolved", "done"):
         try:
-            notif_msg = reason or "Your submitted water point has been officially validated and registered by CHU."
+            notif_msg = reason or "Your submitted water report / concern has been marked as Done and resolved by your Barangay Official."
             sb.table("notifications").insert({
                 "title": f"Water Concern Resolved: {report.get('title') or 'Water Source'}",
                 "message": f"Brgy. {report.get('barangay')}: {notif_msg}",
@@ -172,8 +218,41 @@ async def update_resident_report(
             }).execute()
         except Exception as ex:
             print("Auto-create completed notification failed:", ex)
+    elif status == "dismissed":
+        try:
+            notif_msg = reason or "Your submitted report has been reviewed and dismissed by your Barangay Official."
+            sb.table("notifications").insert({
+                "title": f"Report Dismissed: {report.get('title') or 'Water Concern'}",
+                "message": f"Brgy. {report.get('barangay')}: {notif_msg}",
+                "type": "report_status",
+                "barangay": report.get("barangay"),
+                "target_roles": ["resident"],
+                "created_by": current_user["id"]
+            }).execute()
+        except Exception as ex:
+            print("Auto-create dismissed notification failed:", ex)
 
     return {"success": True, "message": f"Report updated to {status}", "data": report}
+
+
+@router.put("/{report_id}/done")
+async def mark_report_done(
+    report_id: str,
+    body: Optional[ResidentReportAction] = None,
+    current_user: Annotated[dict, Depends(require_roles("barangay_official", "sanitization_inspector", "admin"))] = None
+):
+    """Barangay official marks a resident report as done."""
+    return await update_resident_report(report_id, {"status": "done", "reason": body.reason if body else None}, current_user)
+
+
+@router.put("/{report_id}/dismiss")
+async def mark_report_dismissed(
+    report_id: str,
+    body: Optional[ResidentReportAction] = None,
+    current_user: Annotated[dict, Depends(require_roles("barangay_official", "sanitization_inspector", "admin"))] = None
+):
+    """Barangay official marks a resident report as dismissed."""
+    return await update_resident_report(report_id, {"status": "dismissed", "reason": body.reason if body else None}, current_user)
 
 
 @router.put("/{report_id}/validate")

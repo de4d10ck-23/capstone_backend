@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 
 from core.database import get_supabase
-from core.dependencies import get_current_user, get_optional_user, require_admin_or_inspector
+from core.dependencies import get_current_user, get_optional_user, require_admin_or_inspector, require_water_location_editor
 from core.storage import upload_to_supabase, delete_from_supabase
 from models.water_location import WaterLocationCreate, WaterLocationUpdate
 
@@ -28,9 +28,9 @@ async def list_water_locations(
 
     # Scoped filtering for barangay official or query parameter
     if current_user and current_user.get("role") == "barangay_official" and current_user.get("barangay"):
-        query = query.eq("barangay", current_user["barangay"])
+        query = query.ilike("barangay", current_user["barangay"].strip())
     elif barangay:
-        query = query.eq("barangay", barangay)
+        query = query.ilike("barangay", barangay.strip())
 
     result = query.order("created_at", desc=True).execute()
     locations = []
@@ -53,7 +53,7 @@ async def list_public_water_locations():
     sb = get_supabase()
     result = (
         sb.table("water_locations")
-        .select("id, full_name, barangay, latitude, longitude, coliform_bacteria, e_coli, bacteriological_exam, sample_date, sample_time")
+        .select("id, full_name, barangay, latitude, longitude, coliform_bacteria, e_coli, bacteriological_exam, sample_date, sample_time, image_url, notes")
         .order("created_at", desc=True)
         .execute()
     )
@@ -111,15 +111,19 @@ async def get_water_location_history(
                 s_date = loc.data.get("sample_date")
                 s_time = loc.data.get("sample_time") or "12:00:00"
                 rec_at = f"{s_date}T{s_time}Z" if s_date else (loc.data.get("created_at") or loc.data.get("updated_at") or datetime.now(timezone.utc).isoformat())
+                loc_status = (loc.data.get("status") or "safe").lower()
+                loc_exam = loc.data.get("bacteriological_exam")
+                if not loc_exam or loc_status == "unknown":
+                    loc_exam = "untested" if loc_status == "unknown" else ("failed" if loc_status in ("undrinkable", "contaminated") else "passed")
                 logs = [{
                     "id": f"baseline-{location_id}",
                     "location_id": location_id,
-                    "status": loc.data.get("status") or "safe",
+                    "status": loc_status,
                     "previous_status": None,
-                    "bacteriological_exam": loc.data.get("bacteriological_exam") or "passed",
+                    "bacteriological_exam": loc_exam,
                     "coliform_count": 1 if loc.data.get("coliform_bacteria") else 0,
                     "e_coli_count": 1 if loc.data.get("e_coli") else 0,
-                    "notes": "Initial water source registration",
+                    "notes": "Initial water source registration (Pending safety evaluation)" if loc_status == "unknown" else "Initial water source registration",
                     "recorded_at": rec_at
                 }]
         except Exception as exc:
@@ -132,10 +136,17 @@ async def get_water_location_history(
 @router.post("/")
 async def create_water_location(
     body: WaterLocationCreate,
-    current_user: Annotated[dict, Depends(require_admin_or_inspector)],
+    current_user: Annotated[dict, Depends(require_water_location_editor)],
 ):
-    """Create a new water location. Admin or Inspector only."""
+    """Create a new water location. Admin, Inspector, or Barangay Official."""
     sb = get_supabase()
+
+    # If barangay official, enforce their assigned barangay
+    if current_user.get("role") == "barangay_official":
+        user_brgy = (current_user.get("barangay") or "").strip()
+        if not user_brgy:
+            raise HTTPException(status_code=400, detail="Your user profile does not have an assigned barangay.")
+        body.barangay = user_brgy
 
     # Validate Maasin bounds
     if not (10.0 <= body.latitude <= 10.3) or not (124.7 <= body.longitude <= 125.1):
@@ -180,14 +191,23 @@ async def create_water_location(
         new_id = result.data[0]["id"]
         s_date = body.sample_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         s_time = body.sample_time or datetime.now(timezone.utc).strftime("%H:%M:%S")
+        init_exam = body.bacteriological_exam
+        if not init_exam:
+            if status_val == "safe":
+                init_exam = "passed"
+            elif status_val == "unknown":
+                init_exam = "untested"
+            else:
+                init_exam = "failed"
+
         sb.table("water_status_logs").insert({
             "location_id": new_id,
             "status": status_val,
             "previous_status": None,
-            "bacteriological_exam": body.bacteriological_exam or ("passed" if status_val == "safe" else "failed"),
+            "bacteriological_exam": init_exam,
             "coliform_count": body.coliform_count if body.coliform_count is not None else (1 if body.coliform_bacteria else 0),
             "e_coli_count": body.e_coli_count if body.e_coli_count is not None else (1 if body.e_coli else 0),
-            "notes": notes_val or "Initial water source registration",
+            "notes": notes_val or ("Initial water source registration (Pending safety evaluation)" if status_val == "unknown" else "Initial water source registration"),
             "recorded_by": current_user["id"],
             "recorded_at": f"{s_date}T{s_time}Z",
         }).execute()
@@ -202,9 +222,9 @@ async def create_water_location(
 async def update_water_location(
     location_id: str,
     body: WaterLocationUpdate,
-    current_user: Annotated[dict, Depends(require_admin_or_inspector)],
+    current_user: Annotated[dict, Depends(require_water_location_editor)],
 ):
-    """Update a water location. Admin or Inspector only."""
+    """Update a water location. Admin, Inspector, or Barangay Official."""
     sb = get_supabase()
 
     # Fetch existing state for transition audit
@@ -213,6 +233,17 @@ async def update_water_location(
         existing = sb.table("water_locations").select("*").eq("id", location_id).single().execute()
     except Exception as fetch_err:
         logger.warning(f"Could not fetch existing water location: {fetch_err}")
+
+    if not existing or not existing.data:
+        raise HTTPException(status_code=404, detail="Water location not found")
+
+    # If barangay official, ensure they can only edit their own barangay
+    if current_user.get("role") == "barangay_official":
+        user_brgy = (current_user.get("barangay") or "").strip().lower()
+        existing_brgy = (existing.data.get("barangay") or "").strip().lower()
+        if not user_brgy or existing_brgy != user_brgy:
+            raise HTTPException(status_code=403, detail="You can only edit water stations in your assigned barangay.")
+        body.barangay = existing.data.get("barangay")
 
     update_data = {k: v for k, v in body.model_dump().items() if v is not None}
 
@@ -282,14 +313,23 @@ async def update_water_location(
 @router.delete("/{location_id}/")
 async def delete_water_location(
     location_id: str,
-    current_user: Annotated[dict, Depends(require_admin_or_inspector)],
+    current_user: Annotated[dict, Depends(require_water_location_editor)],
 ):
-    """Delete a water location. Admin or Inspector only."""
+    """Delete a water location. Admin, Inspector, or Barangay Official."""
     sb = get_supabase()
 
-    # Get location first to delete image
-    loc = sb.table("water_locations").select("image_url").eq("id", location_id).single().execute()
-    if loc.data and loc.data.get("image_url"):
+    # Get location first to check permissions and delete image
+    loc = sb.table("water_locations").select("image_url, barangay").eq("id", location_id).single().execute()
+    if not loc.data:
+        raise HTTPException(status_code=404, detail="Water location not found")
+
+    if current_user.get("role") == "barangay_official":
+        user_brgy = (current_user.get("barangay") or "").strip().lower()
+        existing_brgy = (loc.data.get("barangay") or "").strip().lower()
+        if not user_brgy or existing_brgy != user_brgy:
+            raise HTTPException(status_code=403, detail="You can only delete water stations in your assigned barangay.")
+
+    if loc.data.get("image_url"):
         await delete_from_supabase(loc.data["image_url"])
 
     result = sb.table("water_locations").delete().eq("id", location_id).execute()
@@ -303,7 +343,7 @@ async def delete_water_location(
 @router.post("/upload-image/")
 async def upload_image(
     file: UploadFile = File(...),
-    current_user: Annotated[dict, Depends(require_admin_or_inspector)] = None,
+    current_user: Annotated[dict, Depends(require_water_location_editor)] = None,
 ):
     """Upload an image for a water location to Supabase Storage."""
     if not file.filename:

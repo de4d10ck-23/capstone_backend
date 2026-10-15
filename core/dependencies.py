@@ -104,5 +104,6 @@ def require_roles(*allowed_roles: str):
 require_admin = require_roles("admin")
 require_admin_or_inspector = require_roles("admin", "sanitization_inspector")
 require_admin_cho_inspector = require_roles("admin", "city_health_officer", "sanitization_inspector")
+require_water_location_editor = require_roles("admin", "sanitization_inspector", "barangay_official")
 require_staff = require_roles("admin", "city_health_officer", "sanitization_inspector", "barangay_official")
 require_any_authenticated = get_current_user
