@@ -97,7 +97,6 @@ CREATE TABLE inspection_requests (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     location_id UUID REFERENCES water_locations(id) ON DELETE CASCADE,
     description TEXT NOT NULL,
-    priority TEXT DEFAULT 'medium',
     latitude FLOAT,
     longitude FLOAT,
     barangay TEXT,

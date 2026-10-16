@@ -190,9 +190,17 @@ async def update_resident_report(
     if pass_to_inspector or status == "escalated":
         category_label = str(report.get("type") or "Concern").replace("_", " ").title()
         proof_note = f" (Photo Proof attached)" if report.get("image_url") else ""
+        
+        # Extract location_id if present in description (e.g. ID: <uuid>)
+        loc_id = None
+        desc_text = report.get("description") or ""
+        id_match = re.search(r'\(ID:\s*([a-f0-9\-]+)\)', desc_text)
+        if id_match:
+            loc_id = id_match.group(1)
+
         inspection_payload = {
+            "location_id": loc_id,
             "description": f"[{category_label} passed to CHU by Brgy Official] {report.get('title')}: {report.get('description')}{proof_note}",
-            "priority": "high",
             "barangay": report.get("barangay"),
             "latitude": report.get("latitude") or 10.1330,
             "longitude": report.get("longitude") or 124.8700,
@@ -314,11 +322,16 @@ async def escalate_report(
          raise HTTPException(status_code=404, detail="Report not found")
     
     report = result.data[0]
-    category_label = str(report.get("type") or "Concern").replace("_", " ").title()
-    proof_note = f" (Photo Proof attached)" if report.get("image_url") else ""
+    # Extract location_id if present in description (e.g. ID: <uuid>)
+    loc_id = None
+    desc_text = report.get("description") or ""
+    id_match = re.search(r'\(ID:\s*([a-f0-9\-]+)\)', desc_text)
+    if id_match:
+        loc_id = id_match.group(1)
+
     inspection_payload = {
+        "location_id": loc_id,
         "description": f"[{category_label} passed to CHU by Brgy Official] {report.get('title')}: {report.get('description')}{proof_note}",
-        "priority": "high",
         "barangay": report.get("barangay"),
         "latitude": report.get("latitude") or 10.1330,
         "longitude": report.get("longitude") or 124.8700,

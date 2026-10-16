@@ -45,7 +45,6 @@ async def create_inspection(
     new_request = {
         "location_id": body.location_id,
         "description": body.description,
-        "priority": body.priority,
         "latitude": body.latitude,
         "longitude": body.longitude,
         "barangay": req_barangay,
@@ -66,27 +65,53 @@ async def update_inspection(
     body: dict,
     current_user: Annotated[dict, Depends(require_roles("sanitization_inspector", "barangay_official", "admin", "city_health_officer"))]
 ):
-    """Update inspection request status, notes, or assignment."""
+    """Update inspection request status, notes, or location."""
     sb = get_supabase()
     status = body.get("status")
     notes = body.get("notes")
     assigned_to = body.get("assigned_to")
+    location_id = body.get("location_id")
 
     update_data = {}
     if status:
-        update_data["status"] = status
+        update_data["status"] = "completed" if status in ("completed", "done") else status
     if notes is not None:
         update_data["notes"] = notes
+    if location_id:
+        update_data["location_id"] = location_id
     if assigned_to:
         update_data["assigned_to"] = assigned_to
-    elif current_user["role"] == "sanitization_inspector" and (status == "in_progress" or status == "assigned"):
+    elif current_user["role"] == "sanitization_inspector" and (status in ("in_progress", "completed", "done")):
         update_data["assigned_to"] = current_user["id"]
 
     result = sb.table("inspection_requests").update(update_data).eq("id", request_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Inspection request not found")
 
-    return {"success": True, "message": "Inspection updated successfully", "data": result.data[0]}
+    updated_inspection = result.data[0]
+
+    # If completed/done, auto-complete any corresponding resident report that was passed to CHU
+    if status in ("completed", "done"):
+        try:
+            insp_brgy = updated_inspection.get("barangay")
+            insp_desc = updated_inspection.get("description") or ""
+            res_query = sb.table("resident_reports").select("id, title, barangay, submitted_by").eq("status", "escalated")
+            if insp_brgy:
+                res_query = res_query.eq("barangay", insp_brgy)
+            escalated_reports = res_query.execute()
+
+            for rep in (escalated_reports.data or []):
+                rep_title = rep.get("title") or ""
+                if rep_title and rep_title in insp_desc:
+                    sb.table("resident_reports").update({
+                        "status": "completed",
+                        "reason": notes or "Sanitization inspection and field audit completed by inspector."
+                    }).eq("id", rep["id"]).execute()
+                    break
+        except Exception as sync_err:
+            print("Auto-complete corresponding resident report error:", sync_err)
+
+    return {"success": True, "message": "Inspection updated successfully", "data": updated_inspection}
 
 
 @router.put("/{request_id}/assign")

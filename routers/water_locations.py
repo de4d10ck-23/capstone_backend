@@ -110,7 +110,8 @@ async def get_water_location_history(
             if loc.data:
                 s_date = loc.data.get("sample_date")
                 s_time = loc.data.get("sample_time") or "12:00:00"
-                rec_at = f"{s_date}T{s_time}Z" if s_date else (loc.data.get("created_at") or loc.data.get("updated_at") or datetime.now(timezone.utc).isoformat())
+                formatted_time = s_time if len(s_time) == 8 else f"{s_time}:00" if len(s_time) == 5 else "12:00:00"
+                rec_at = f"{s_date}T{formatted_time}+08:00" if s_date else (loc.data.get("created_at") or loc.data.get("updated_at") or datetime.now(timezone.utc).isoformat())
                 loc_status = (loc.data.get("status") or "safe").lower()
                 loc_exam = loc.data.get("bacteriological_exam")
                 if not loc_exam or loc_status == "unknown":
@@ -124,12 +125,58 @@ async def get_water_location_history(
                     "coliform_count": 1 if loc.data.get("coliform_bacteria") else 0,
                     "e_coli_count": 1 if loc.data.get("e_coli") else 0,
                     "notes": "Initial water source registration (Pending safety evaluation)" if loc_status == "unknown" else "Initial water source registration",
-                    "recorded_at": rec_at
+                    "recorded_at": rec_at,
+                    "sample_date": s_date,
+                    "sample_time": s_time,
                 }]
         except Exception as exc:
             logger.warning(f"Error generating baseline status log: {exc}")
 
-    return {"success": True, "data": logs}
+    # Standardize sample_date and sample_time on each log to avoid local timezone offset shifting
+    for log in logs:
+        rec = log.get("recorded_at") or ""
+        if "T" in rec:
+            log["sample_date"] = rec.split("T")[0]
+            time_part = rec.split("T")[1].replace("Z", "").split("+")[0]
+            log["sample_time"] = time_part[:8] if len(time_part) >= 8 else time_part
+
+    # Identify the chronologically latest audit log
+    def get_sort_key(item):
+        s_d = item.get("sample_date") or ""
+        s_t = item.get("sample_time") or "00:00:00"
+        return f"{s_d}T{s_t}"
+
+    sorted_logs = sorted(logs, key=get_sort_key)
+    latest_log = sorted_logs[-1] if sorted_logs else None
+
+    # Auto-synchronize water_locations if it currently has an outdated status/sample_date
+    if latest_log:
+        try:
+            loc = sb.table("water_locations").select("id, status, sample_date, sample_time").eq("id", location_id).single().execute()
+            if loc.data:
+                curr_date = loc.data.get("sample_date") or ""
+                curr_time = loc.data.get("sample_time") or "00:00:00"
+                curr_key = f"{curr_date}T{curr_time}"
+                latest_key = get_sort_key(latest_log)
+
+                # Sync only if the audit log is strictly newer than the station's sample date
+                if latest_key > curr_key:
+                    sync_payload = {
+                        "status": latest_log.get("status") or loc.data.get("status"),
+                        "sample_date": latest_log.get("sample_date"),
+                        "sample_time": latest_log.get("sample_time"),
+                        "bacteriological_exam": latest_log.get("bacteriological_exam"),
+                        "coliform_bacteria": (latest_log.get("coliform_count") or 0) > 0 if latest_log.get("status") != "unknown" else False,
+                        "e_coli": (latest_log.get("e_coli_count") or 0) > 0 if latest_log.get("status") != "unknown" else False,
+                        "updated_at": datetime.now(timezone.utc).isoformat()
+                    }
+                    if latest_log.get("notes"):
+                        sync_payload["notes"] = latest_log["notes"]
+                    sb.table("water_locations").update(sync_payload).eq("id", location_id).execute()
+        except Exception as sync_err:
+            logger.warning(f"Could not auto-sync water location status: {sync_err}")
+
+    return {"success": True, "data": sorted_logs, "latest": latest_log}
 
 
 @router.post("", include_in_schema=False)
@@ -191,6 +238,7 @@ async def create_water_location(
         new_id = result.data[0]["id"]
         s_date = body.sample_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         s_time = body.sample_time or datetime.now(timezone.utc).strftime("%H:%M:%S")
+        formatted_time = s_time if len(s_time) == 8 else f"{s_time}:00" if len(s_time) == 5 else "12:00:00"
         init_exam = body.bacteriological_exam
         if not init_exam:
             if status_val == "safe":
@@ -209,7 +257,7 @@ async def create_water_location(
             "e_coli_count": body.e_coli_count if body.e_coli_count is not None else (1 if body.e_coli else 0),
             "notes": notes_val or ("Initial water source registration (Pending safety evaluation)" if status_val == "unknown" else "Initial water source registration"),
             "recorded_by": current_user["id"],
-            "recorded_at": f"{s_date}T{s_time}Z",
+            "recorded_at": f"{s_date}T{formatted_time}+08:00",
         }).execute()
     except Exception as log_exc:
         logger.warning(f"Could not record initial water status log: {log_exc}")
@@ -276,34 +324,97 @@ async def update_water_location(
     update_data.pop("coliform_count", None)
     update_data.pop("e_coli_count", None)
 
+    # 1. Record status audit in water_status_logs
+    old_status = existing.data.get("status") if existing and existing.data else None
+    new_status = update_data.get("status") or old_status or "safe"
+    s_date = update_data.get("sample_date") or (existing.data.get("sample_date") if existing and existing.data else None) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    s_time = update_data.get("sample_time") or (existing.data.get("sample_time") if existing and existing.data else None) or datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+    formatted_time = s_time if len(s_time) == 8 else f"{s_time}:00" if len(s_time) == 5 else "12:00:00"
+    rec_timestamp = f"{s_date}T{formatted_time}+08:00"
+
+    # Replace any previous log for this exact date on this location so editing a day's status replaces it cleanly
+    try:
+        same_date_logs = sb.table("water_status_logs").select("id, recorded_at").eq("location_id", location_id).execute()
+        for old_l in (same_date_logs.data or []):
+            rec = old_l.get("recorded_at") or ""
+            if rec.startswith(s_date) or (f"{s_date}T" in rec):
+                sb.table("water_status_logs").delete().eq("id", old_l["id"]).execute()
+    except Exception as del_err:
+        logger.warning(f"Could not clean previous log for date {s_date}: {del_err}")
+
+    try:
+        log_entry = {
+            "location_id": location_id,
+            "status": new_status,
+            "previous_status": old_status,
+            "bacteriological_exam": "untested" if new_status == "unknown" else (update_data.get("bacteriological_exam") or (existing.data.get("bacteriological_exam") if existing and existing.data else None)),
+            "coliform_count": 0 if new_status == "unknown" else (body.coliform_count if body.coliform_count is not None else (1 if update_data.get("coliform_bacteria") else 0)),
+            "e_coli_count": 0 if new_status == "unknown" else (body.e_coli_count if body.e_coli_count is not None else (1 if update_data.get("e_coli") else 0)),
+            "notes": update_data.get("notes") or f"Status updated to {new_status}",
+            "recorded_by": current_user.get("id"),
+            "recorded_at": rec_timestamp,
+        }
+        sb.table("water_status_logs").insert(log_entry).execute()
+    except Exception as log_exc:
+        logger.warning(f"Could not record water status log: {log_exc}")
+
+    # 2. Determine chronologically latest audit test so water_locations always reflects the latest test
+    try:
+        all_logs_res = sb.table("water_status_logs").select("*").eq("location_id", location_id).order("recorded_at", desc=False).execute()
+        all_logs = all_logs_res.data or []
+
+        def get_log_sort_key(item):
+            rec = item.get("recorded_at") or ""
+            if "T" in rec:
+                date_part = rec.split("T")[0]
+                time_part = rec.split("T")[1].replace("Z", "").split("+")[0][:8]
+                return f"{date_part}T{time_part}"
+            return rec
+
+        if all_logs:
+            sorted_logs = sorted(all_logs, key=get_log_sort_key)
+            latest_log = sorted_logs[-1]
+
+            curr_sub_key = f"{s_date}T{formatted_time}"
+            latest_key = get_log_sort_key(latest_log)
+
+            # If user's submitted test is the latest (or >= latest key), use user's submitted status directly
+            if curr_sub_key >= latest_key:
+                effective_status = new_status
+                effective_date = s_date
+                effective_time = formatted_time
+                effective_exam = "untested" if new_status == "unknown" else update_data.get("bacteriological_exam")
+                effective_notes = update_data.get("notes")
+            else:
+                effective_status = latest_log.get("status") or new_status
+                latest_rec = latest_log.get("recorded_at") or ""
+                effective_date = latest_rec.split("T")[0] if "T" in latest_rec else s_date
+                effective_time = latest_rec.split("T")[1].replace("Z", "").split("+")[0][:8] if "T" in latest_rec else formatted_time
+                effective_exam = latest_log.get("bacteriological_exam")
+                effective_notes = latest_log.get("notes")
+
+            water_loc_sync = {
+                "status": effective_status,
+                "bacteriological_exam": effective_exam,
+                "sample_date": effective_date,
+                "sample_time": effective_time,
+                "coliform_bacteria": (latest_log.get("coliform_count") or 0) > 0 if effective_status != "unknown" else False,
+                "e_coli": (latest_log.get("e_coli_count") or 0) > 0 if effective_status != "unknown" else False,
+            }
+            if effective_notes:
+                water_loc_sync["notes"] = effective_notes
+
+            update_data.update(water_loc_sync)
+    except Exception as latest_exc:
+        logger.warning(f"Could not compute latest status log: {latest_exc}")
+
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     result = sb.table("water_locations").update(update_data).eq("id", location_id).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Water location not found")
-
-    # Record status transition in water_status_logs audit trail
-    try:
-        old_status = existing.data.get("status") if existing and existing.data else None
-        new_status = update_data.get("status") or old_status or "safe"
-        s_date = update_data.get("sample_date") or (existing.data.get("sample_date") if existing and existing.data else None) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        s_time = update_data.get("sample_time") or (existing.data.get("sample_time") if existing and existing.data else None) or datetime.now(timezone.utc).strftime("%H:%M:%S")
-
-        log_entry = {
-            "location_id": location_id,
-            "status": new_status,
-            "previous_status": old_status,
-            "bacteriological_exam": update_data.get("bacteriological_exam") or (existing.data.get("bacteriological_exam") if existing and existing.data else None),
-            "coliform_count": body.coliform_count if body.coliform_count is not None else (1 if update_data.get("coliform_bacteria") else 0),
-            "e_coli_count": body.e_coli_count if body.e_coli_count is not None else (1 if update_data.get("e_coli") else 0),
-            "notes": update_data.get("notes") or f"Status updated to {new_status}",
-            "recorded_by": current_user.get("id"),
-            "recorded_at": f"{s_date}T{s_time}Z",
-        }
-        sb.table("water_status_logs").insert(log_entry).execute()
-    except Exception as log_exc:
-        logger.warning(f"Could not record water status log: {log_exc}")
 
     return {"success": True, "message": "Water location updated", "data": result.data[0]}
 
