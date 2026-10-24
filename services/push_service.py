@@ -225,6 +225,8 @@ async def broadcast_push_notification(
     payload = json.dumps({
         "title": title,
         "body": message,
+        "icon": "/images/logo/waterwatch-icon-192.png",
+        "badge": "/images/logo/waterwatch-badge.png",
         "url": url,
         "tag": tag,
         "timestamp": datetime.now().isoformat(),

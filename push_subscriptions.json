@@ -1,16 +1,16 @@
 {
-  "https://fcm.googleapis.com/fcm/send/f4CShbYNZW8:APA91bF_awd73TyngJ8AcyrhdgFG2zFK0v_W_FcRutBLPF-vHLHi1c9qQ2F81A_uS_9F0BS6mg1mZdcOu8aeAuF6LyqKgzNd0DnEgBc69rgqS7bA1i8AOPzoVljoDNaMnR-2c1hlL9Nd": {
-    "endpoint": "https://fcm.googleapis.com/fcm/send/f4CShbYNZW8:APA91bF_awd73TyngJ8AcyrhdgFG2zFK0v_W_FcRutBLPF-vHLHi1c9qQ2F81A_uS_9F0BS6mg1mZdcOu8aeAuF6LyqKgzNd0DnEgBc69rgqS7bA1i8AOPzoVljoDNaMnR-2c1hlL9Nd",
+  "https://fcm.googleapis.com/fcm/send/dy3t56UZ0Cs:APA91bFQS1mu-7mnvgMCTBwdwNsdSoc93WPO90JEcJnHwBb6su87kEQzXxPjz8P-mUPptjZ2tZwUYj3vJNiDnALDFjBXICXKNpAy4Qi1bxbPEF_8zvlE3bRM-sOcjhnUJ4sd31YyqE37": {
+    "endpoint": "https://fcm.googleapis.com/fcm/send/dy3t56UZ0Cs:APA91bFQS1mu-7mnvgMCTBwdwNsdSoc93WPO90JEcJnHwBb6su87kEQzXxPjz8P-mUPptjZ2tZwUYj3vJNiDnALDFjBXICXKNpAy4Qi1bxbPEF_8zvlE3bRM-sOcjhnUJ4sd31YyqE37",
     "subscription": {
-      "endpoint": "https://fcm.googleapis.com/fcm/send/f4CShbYNZW8:APA91bF_awd73TyngJ8AcyrhdgFG2zFK0v_W_FcRutBLPF-vHLHi1c9qQ2F81A_uS_9F0BS6mg1mZdcOu8aeAuF6LyqKgzNd0DnEgBc69rgqS7bA1i8AOPzoVljoDNaMnR-2c1hlL9Nd",
+      "endpoint": "https://fcm.googleapis.com/fcm/send/dy3t56UZ0Cs:APA91bFQS1mu-7mnvgMCTBwdwNsdSoc93WPO90JEcJnHwBb6su87kEQzXxPjz8P-mUPptjZ2tZwUYj3vJNiDnALDFjBXICXKNpAy4Qi1bxbPEF_8zvlE3bRM-sOcjhnUJ4sd31YyqE37",
       "expirationTime": null,
       "keys": {
-        "p256dh": "BFPgp03I5rUcZabx4zeohNWvidRUBYAld4QC2uIRfjIsWD3zZLhIDTJ9xuYxUEOTm_dg_mpyMykFG5FNCqH8yHg",
-        "auth": "UMpUq6_chNSTMGVsfb6U2g"
+        "p256dh": "BJZrFRC8cJIoVuzHgCmLSv1pi_XD7Pq4qSUa0S-8rK0lr8M1_zOmlyBWa6rZKeCWeVxlUiU_yP2f3zsI7vVowvI",
+        "auth": "w2A-f-Bk3OYBjNFimiG_zA"
       }
     },
     "user_id": "ea2c770c-1bdd-4b32-bf62-478dbd49cbe7",
     "barangay": "hantag",
-    "updated_at": "2026-10-24T20:31:39.602215"
+    "updated_at": "2026-10-24T20:54:59.854707"
   }
 }
