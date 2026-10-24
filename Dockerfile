@@ -28,5 +28,5 @@ COPY . .
 # Expose port
 EXPOSE 8080
 
-# Start FastAPI server via main.py
-CMD ["python", "main.py"]
+# Start FastAPI server with Cloud Run dynamic port binding and signal handling
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips '*'"]

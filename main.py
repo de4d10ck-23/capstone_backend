@@ -50,12 +50,15 @@ app.include_router(hazards.router)
 app.include_router(weather.router)
 
 if __name__ == "__main__":
+    import os
     import uvicorn
+    port = int(os.getenv("PORT", str(settings.PORT or 8080)))
+    is_cloud_run = bool(os.getenv("K_SERVICE"))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=settings.PORT,
-        reload=True,
+        port=port,
+        reload=False if is_cloud_run else True,
         proxy_headers=True,
         forwarded_allow_ips="*",
     )

@@ -500,9 +500,11 @@ def start_heatmap_scheduler():
     """Start the background scheduler task."""
     global _scheduler_task
     if _scheduler_task is None or _scheduler_task.done():
-        loop = asyncio.get_event_loop()
-        _scheduler_task = loop.create_task(hourly_heatmap_worker())
-        logger.info("Started background task for hourly heatmap updates.")
+        try:
+            _scheduler_task = asyncio.create_task(hourly_heatmap_worker())
+            logger.info("Started background task for hourly heatmap updates.")
+        except Exception as e:
+            logger.warning(f"Could not initialize heatmap scheduler background task: {e}")
 
 
 def stop_heatmap_scheduler():
