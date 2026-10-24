@@ -67,6 +67,8 @@ def run_training_tournament():
                     max_depth=6,
                     min_samples_split=4,
                     min_samples_leaf=2,
+                    class_weight="balanced",
+                    criterion="gini",
                     random_state=42,
                 ),
             ),

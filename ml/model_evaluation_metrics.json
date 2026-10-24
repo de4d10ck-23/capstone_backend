@@ -1,13 +1,11 @@
 {
   "study": "Participatory GIS & Random Forest Water Quality Early Warning",
-  "timestamp": "2026-09-16T18:15:44.716305",
-  "total_samples": 708,
-  "feature_count": 9,
+  "timestamp": "2026-10-24T17:10:03.077985",
+  "total_samples": 720,
+  "feature_count": 7,
   "features": [
-    "distance_to_latrine_meters",
-    "distance_to_river_meters",
-    "distance_to_farmland_meters",
-    "buffer_encroachments_count",
+    "flood_susceptibility_level",
+    "landslide_susceptibility_level",
     "rainfall_intensity_mm",
     "cumulative_48h_rainfall_mm",
     "temperature_celsius",
@@ -16,134 +14,124 @@
   ],
   "cross_validation_5fold": {
     "Logistic Regression (Linear Baseline)": {
-      "mean_accuracy": 0.7632665735134296,
-      "std_accuracy": 0.018671848041870248,
-      "mean_precision": 0.7868222226775303,
-      "mean_recall": 0.8780451684561272,
-      "mean_f1": 0.8287822657054248
+      "mean_accuracy": 0.7829535232383809,
+      "std_accuracy": 0.022948797812023913,
+      "mean_precision": 0.8096350203978352,
+      "mean_recall": 0.9099030267411108,
+      "mean_f1": 0.8564507082189531
     },
     "Decision Tree (Single Tree Baseline)": {
-      "mean_accuracy": 0.7614190343114423,
-      "std_accuracy": 0.028441822261588305,
-      "mean_precision": 0.8591848527790897,
-      "mean_recall": 0.7693076638282117,
-      "mean_f1": 0.8050547573772233
+      "mean_accuracy": 0.7899250374812594,
+      "std_accuracy": 0.022979238946624816,
+      "mean_precision": 0.875516404033424,
+      "mean_recall": 0.8248898031148986,
+      "mean_f1": 0.8477454361013466
     },
     "Random Forest (Proposed Ensemble)": {
-      "mean_accuracy": 0.83921751280857,
-      "std_accuracy": 0.025916697123757916,
-      "mean_precision": 0.8710159654003412,
-      "mean_recall": 0.8862643465383192,
-      "mean_f1": 0.8779364199532267
+      "mean_accuracy": 0.7916341829085457,
+      "std_accuracy": 0.026599997429450756,
+      "mean_precision": 0.9328577666563295,
+      "mean_recall": 0.7638848075227741,
+      "mean_f1": 0.8387174229279493
     }
   },
   "held_out_test_metrics": {
     "Logistic Regression (Linear Baseline)": {
-      "accuracy": 0.795774647887324,
-      "precision": 0.8478260869565217,
-      "recall": 0.8387096774193549,
-      "f1_score": 0.8432432432432433,
+      "accuracy": 0.7708333333333334,
+      "precision": 0.7868852459016393,
+      "recall": 0.9320388349514563,
+      "f1_score": 0.8533333333333334,
       "confusion_matrix": [
         [
-          35,
-          14
+          15,
+          26
         ],
         [
-          15,
+          7,
+          96
+        ]
+      ],
+      "tn": 15,
+      "fp": 26,
+      "fn": 7,
+      "tp": 96
+    },
+    "Decision Tree (Single Tree Baseline)": {
+      "accuracy": 0.7986111111111112,
+      "precision": 0.9021739130434783,
+      "recall": 0.8058252427184466,
+      "f1_score": 0.8512820512820513,
+      "confusion_matrix": [
+        [
+          32,
+          9
+        ],
+        [
+          20,
+          83
+        ]
+      ],
+      "tn": 32,
+      "fp": 9,
+      "fn": 20,
+      "tp": 83
+    },
+    "Random Forest (Proposed Ensemble)": {
+      "accuracy": 0.7916666666666666,
+      "precision": 0.9397590361445783,
+      "recall": 0.7572815533980582,
+      "f1_score": 0.8387096774193549,
+      "confusion_matrix": [
+        [
+          36,
+          5
+        ],
+        [
+          25,
           78
         ]
       ],
-      "tn": 35,
-      "fp": 14,
-      "fn": 15,
+      "tn": 36,
+      "fp": 5,
+      "fn": 25,
       "tp": 78
-    },
-    "Decision Tree (Single Tree Baseline)": {
-      "accuracy": 0.7887323943661971,
-      "precision": 0.8987341772151899,
-      "recall": 0.7634408602150538,
-      "f1_score": 0.8255813953488372,
-      "confusion_matrix": [
-        [
-          41,
-          8
-        ],
-        [
-          22,
-          71
-        ]
-      ],
-      "tn": 41,
-      "fp": 8,
-      "fn": 22,
-      "tp": 71
-    },
-    "Random Forest (Proposed Ensemble)": {
-      "accuracy": 0.823943661971831,
-      "precision": 0.8695652173913043,
-      "recall": 0.8602150537634409,
-      "f1_score": 0.8648648648648649,
-      "confusion_matrix": [
-        [
-          37,
-          12
-        ],
-        [
-          13,
-          80
-        ]
-      ],
-      "tn": 37,
-      "fp": 12,
-      "fn": 13,
-      "tp": 80
     }
   },
   "feature_importances": [
     {
-      "feature": "source_type_code",
-      "importance": 0.27718571810011783,
-      "percentage": 27.72
-    },
-    {
-      "feature": "distance_to_farmland_meters",
-      "importance": 0.143787660384236,
-      "percentage": 14.38
-    },
-    {
       "feature": "rainfall_intensity_mm",
-      "importance": 0.12225345404629624,
-      "percentage": 12.23
+      "importance": 0.23787484462083475,
+      "percentage": 23.79
+    },
+    {
+      "feature": "source_type_code",
+      "importance": 0.20146968510540966,
+      "percentage": 20.15
     },
     {
       "feature": "cumulative_48h_rainfall_mm",
-      "importance": 0.10548381468958072,
-      "percentage": 10.55
-    },
-    {
-      "feature": "distance_to_river_meters",
-      "importance": 0.10248417173900223,
-      "percentage": 10.25
-    },
-    {
-      "feature": "distance_to_latrine_meters",
-      "importance": 0.10026432958757829,
-      "percentage": 10.03
-    },
-    {
-      "feature": "humidity_percent",
-      "importance": 0.07033618478062231,
-      "percentage": 7.03
+      "importance": 0.1647372428337398,
+      "percentage": 16.47
     },
     {
       "feature": "temperature_celsius",
-      "importance": 0.06431043986637477,
-      "percentage": 6.43
+      "importance": 0.13144722354471508,
+      "percentage": 13.14
     },
     {
-      "feature": "buffer_encroachments_count",
-      "importance": 0.013894226806191656,
-      "percentage": 1.39
+      "feature": "humidity_percent",
+      "importance": 0.12703078403826595,
+      "percentage": 12.7
+    },
+    {
+      "feature": "flood_susceptibility_level",
+      "importance": 0.07509235938138928,
+      "percentage": 7.51
+    },
+    {
+      "feature": "landslide_susceptibility_level",
+      "importance": 0.06234786047564555,
+      "percentage": 6.23
     }
   ]
 }

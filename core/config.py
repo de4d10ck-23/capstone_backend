@@ -23,7 +23,7 @@ class Settings:
     ]
     
     JWT_SECRET: str = os.getenv("JWT_SECRET", "dev-insecure-secret-change-me")
-    JWT_EXPIRES_MINUTES: int = int(os.getenv("JWT_EXPIRES_MINUTES", "480"))
+    JWT_EXPIRES_MINUTES: int = int(os.getenv("JWT_EXPIRES_MINUTES", "525600"))
     JWT_ALGORITHM: str = "HS256"
     SUPABASE_STORAGE_BUCKET: str = os.getenv("SUPABASE_STORAGE_BUCKET", "waterwatch-images")
     OPENWEATHER_API_KEY: str = os.getenv("OPENWEATHER_API_KEY", "")

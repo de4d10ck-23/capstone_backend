@@ -102,6 +102,15 @@ def _save_local_subscriptions():
         logger.warning(f"Error saving local subscriptions: {e}")
 
 
+def _normalize_barangay(b: Optional[str]) -> Optional[str]:
+    """Strip common prefixes and normalize barangay names for robust matching."""
+    if not b:
+        return None
+    cleaned = b.strip().lower()
+    cleaned = cleaned.replace("barangay", "").replace("brgy.", "").replace("brgy", "").strip()
+    return cleaned if cleaned else None
+
+
 def save_push_subscription(subscription: Dict[str, Any], user_id: Optional[str] = None, barangay: Optional[str] = None) -> bool:
     """
     Store or update a resident device's push subscription token.
@@ -115,11 +124,12 @@ def save_push_subscription(subscription: Dict[str, Any], user_id: Optional[str] 
         "endpoint": endpoint,
         "subscription": subscription,
         "user_id": user_id,
-        "barangay": (barangay or "").strip().lower() if barangay else None,
+        "barangay": _normalize_barangay(barangay),
         "updated_at": datetime.now().isoformat(),
     }
 
     # Save to memory & local store
+    _load_local_subscriptions()
     _local_subscriptions[endpoint] = sub_entry
     _save_local_subscriptions()
 
@@ -137,6 +147,7 @@ def save_push_subscription(subscription: Dict[str, Any], user_id: Optional[str] 
         # Table might not exist yet in Supabase, local storage takes over seamlessly
         logger.info(f"Supabase push_subscriptions sync notice (using local storage): {e}")
 
+    logger.info(f"Successfully saved push subscription for user {user_id} (barangay: {sub_entry['barangay']})")
     return True
 
 
@@ -145,6 +156,7 @@ def remove_push_subscription(endpoint: str) -> bool:
     if not endpoint:
         return False
 
+    _load_local_subscriptions()
     if endpoint in _local_subscriptions:
         del _local_subscriptions[endpoint]
         _save_local_subscriptions()
@@ -160,6 +172,9 @@ def remove_push_subscription(endpoint: str) -> bool:
 
 def get_active_subscriptions(target_barangay: Optional[str] = None) -> List[Dict[str, Any]]:
     """Fetch all active subscriptions matching target barangay (or all if broadcast)."""
+    # Always reload to pick up freshly subscribed devices immediately
+    _load_local_subscriptions()
+
     # 1. Try Supabase first
     subs_list = []
     try:
@@ -170,7 +185,7 @@ def get_active_subscriptions(target_barangay: Optional[str] = None) -> List[Dict
                 subs_list.append({
                     "endpoint": item.get("endpoint"),
                     "subscription": item.get("subscription_json"),
-                    "barangay": (item.get("barangay") or "").strip().lower() if item.get("barangay") else None,
+                    "barangay": _normalize_barangay(item.get("barangay")),
                 })
     except Exception as e:
         logger.debug(f"Reading from local subscriptions fallback: {e}")
@@ -180,13 +195,13 @@ def get_active_subscriptions(target_barangay: Optional[str] = None) -> List[Dict
         subs_list = list(_local_subscriptions.values())
 
     # Filter by target barangay if specified
-    if not target_barangay or target_barangay.lower() in ["all", "city-wide", "all barangays"]:
+    norm_target = _normalize_barangay(target_barangay)
+    if not norm_target or norm_target in ["all", "city-wide", "all barangays"]:
         return subs_list
 
-    norm_target = target_barangay.strip().lower()
     filtered = [
         s for s in subs_list
-        if not s.get("barangay") or s.get("barangay") == norm_target
+        if not s.get("barangay") or _normalize_barangay(s.get("barangay")) == norm_target
     ]
     return filtered
 

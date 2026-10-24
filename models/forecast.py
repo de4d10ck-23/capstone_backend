@@ -9,6 +9,6 @@ class ForecastConfig(BaseModel):
     humidity_weight: Optional[float] = 0.15
     proximity_weight: Optional[float] = 0.2
     historical_weight: Optional[float] = 0.15
-    risk_threshold_low: Optional[float] = 0.3
-    risk_threshold_high: Optional[float] = 0.7
+    risk_threshold_low: Optional[float] = 0.30
+    risk_threshold_high: Optional[float] = 0.65
     prediction_days: Optional[int] = 7

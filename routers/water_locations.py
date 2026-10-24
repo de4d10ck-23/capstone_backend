@@ -8,6 +8,7 @@ from core.database import get_supabase
 from core.dependencies import get_current_user, get_optional_user, require_admin_or_inspector, require_water_location_editor
 from core.storage import upload_to_supabase, delete_from_supabase
 from models.water_location import WaterLocationCreate, WaterLocationUpdate
+from services.push_service import broadcast_push_notification
 
 logger = logging.getLogger(__name__)
 
@@ -216,9 +217,9 @@ async def create_water_location(
         "barangay": body.barangay,
         "latitude": body.latitude,
         "longitude": body.longitude,
-        "coliform_bacteria": body.coliform_bacteria if body.coliform_bacteria is not None else ((body.coliform_count or 0) > 0),
-        "e_coli": body.e_coli if body.e_coli is not None else ((body.e_coli_count or 0) > 0),
-        "bacteriological_exam": exam,
+        "coliform_bacteria": None if status_val == "unknown" else (body.coliform_bacteria if body.coliform_bacteria is not None else ((body.coliform_count or 0) > 0)),
+        "e_coli": None if status_val == "unknown" else (body.e_coli if body.e_coli is not None else ((body.e_coli_count or 0) > 0)),
+        "bacteriological_exam": "untested" if status_val == "unknown" else exam,
         "image_url": body.image_url,
         "sample_date": body.sample_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "sample_time": body.sample_time or datetime.now(timezone.utc).strftime("%H:%M:%S"),
@@ -396,11 +397,11 @@ async def update_water_location(
 
             water_loc_sync = {
                 "status": effective_status,
-                "bacteriological_exam": effective_exam,
+                "bacteriological_exam": "untested" if effective_status == "unknown" else effective_exam,
                 "sample_date": effective_date,
                 "sample_time": effective_time,
-                "coliform_bacteria": (latest_log.get("coliform_count") or 0) > 0 if effective_status != "unknown" else False,
-                "e_coli": (latest_log.get("e_coli_count") or 0) > 0 if effective_status != "unknown" else False,
+                "coliform_bacteria": ((latest_log.get("coliform_count") or 0) > 0) if effective_status != "unknown" else None,
+                "e_coli": ((latest_log.get("e_coli_count") or 0) > 0) if effective_status != "unknown" else None,
             }
             if effective_notes:
                 water_loc_sync["notes"] = effective_notes
@@ -409,6 +410,11 @@ async def update_water_location(
     except Exception as latest_exc:
         logger.warning(f"Could not compute latest status log: {latest_exc}")
 
+    if update_data.get("status") == "unknown":
+        update_data["e_coli"] = None
+        update_data["coliform_bacteria"] = None
+        update_data["bacteriological_exam"] = "untested"
+
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     result = sb.table("water_locations").update(update_data).eq("id", location_id).execute()
@@ -416,7 +422,34 @@ async def update_water_location(
     if not result.data:
         raise HTTPException(status_code=404, detail="Water location not found")
 
-    return {"success": True, "message": "Water location updated", "data": result.data[0]}
+    updated_station = result.data[0]
+
+    # Automatically dispatch Boil Water advisory if water source transitioned to contaminated
+    if new_status in ("contaminated", "undrinkable") and old_status not in ("contaminated", "undrinkable"):
+        try:
+            st_name = updated_station.get("full_name") or updated_station.get("name") or "Water Source"
+            target_brgy = updated_station.get("barangay")
+            auto_notif = {
+                "title": f"⚠️ Boil Water Notice: {st_name}",
+                "message": f"Water source '{st_name}' in Brgy. {target_brgy} has been flagged as CONTAMINATED (E. coli detected). Residents are strongly advised to boil water before drinking or use alternative safe stations.",
+                "type": "critical",
+                "barangay": target_brgy,
+                "target_roles": ["resident", "barangay_official"],
+                "created_by": current_user["id"],
+            }
+            n_res = sb.table("notifications").insert(auto_notif).execute()
+            await broadcast_push_notification(
+                title=auto_notif["title"],
+                message=auto_notif["message"],
+                barangay=target_brgy,
+                url="/portal/notifications",
+                tag=f"contam-alert-{location_id}",
+            )
+            logger.info(f"Dispatched automated Boil Water push notification for station {st_name} in {target_brgy}")
+        except Exception as auto_notif_err:
+            logger.warning(f"Could not dispatch automatic contamination notification: {auto_notif_err}")
+
+    return {"success": True, "message": "Water location updated", "data": updated_station}
 
 
 

@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import random
 import numpy as np
 import pandas as pd
@@ -11,24 +12,24 @@ BACKEND_ROOT = os.path.dirname(CURRENT_DIR)
 if BACKEND_ROOT not in sys.path:
     sys.path.insert(0, BACKEND_ROOT)
 
-from core.database import get_supabase
-from core.spatial import (
-    calculate_station_hazard_distances,
-    haversine_distance,
-    distance_point_to_linestring,
-    distance_point_to_polygon,
-)
+import shapely.geometry
+from shapely.geometry import shape, Point
 
+from core.database import get_supabase
+
+# ============================================================================
+# RECOMMENDED FEATURE PARAMETERS FOR WATER CONTAMINATION FORECASTING
+# Aligned with official DENR-MGB GIS hazard layers from Maasin_LandFlood,
+# live meteorological indicators, and WHO/PNSDW sanitary protection levels.
+# ============================================================================
 FEATURE_COLUMNS = [
-    "distance_to_latrine_meters",
-    "distance_to_river_meters",
-    "distance_to_farmland_meters",
-    "buffer_encroachments_count",
-    "rainfall_intensity_mm",
-    "cumulative_48h_rainfall_mm",
-    "temperature_celsius",
-    "humidity_percent",
-    "source_type_code",
+    "flood_susceptibility_level",      # 0: None/Low, 1: Moderate (MF), 2: High (HF)
+    "landslide_susceptibility_level",  # 0: None/Low, 1: Moderate (ML), 2: High (HL)
+    "rainfall_intensity_mm",           # 24-hour cumulative rainfall (mm)
+    "cumulative_48h_rainfall_mm",      # 48-hour cumulative rainfall (mm)
+    "temperature_celsius",             # Ambient temperature (°C)
+    "humidity_percent",                # Relative humidity (%)
+    "source_type_code",                # 0: Open Spring, 1: Reservoir/Tank, 2: Well/Pump, 3: Tap/Faucet
 ]
 
 SOURCE_TYPE_MAPPING = {
@@ -36,17 +37,91 @@ SOURCE_TYPE_MAPPING = {
     "spring": 0,
     "reservoir": 1,
     "tank": 1,
+    "water tank": 1,
     "pump": 2,
     "jetmatic": 2,
     "deep well": 2,
+    "shallow well": 2,
     "well": 2,
     "faucet": 3,
     "tap": 3,
     "bis": 3,
+    "level 3": 3,
+    "communal faucet": 3,
 }
+
+DATA_DIR = os.path.join(BACKEND_ROOT, "data")
+_cached_hazard_shapes = None
+
+
+def load_hazard_shapes():
+    """Load and parse official flood and landslide geometries from GeoJSON."""
+    global _cached_hazard_shapes
+    if _cached_hazard_shapes is not None:
+        return _cached_hazard_shapes
+
+    flood_path = os.path.join(DATA_DIR, "maasin_flood_hazards.json")
+    landslide_path = os.path.join(DATA_DIR, "maasin_landslide_hazards.json")
+
+    flood_shapes = []
+    if os.path.exists(flood_path):
+        try:
+            with open(flood_path, "r", encoding="utf-8") as f:
+                fc = json.load(f)
+                for feat in fc.get("features", []):
+                    if feat.get("geometry"):
+                        flood_shapes.append((shape(feat["geometry"]), feat.get("properties", {})))
+        except Exception as e:
+            print(f"Error reading {flood_path}: {e}")
+
+    landslide_shapes = []
+    if os.path.exists(landslide_path):
+        try:
+            with open(landslide_path, "r", encoding="utf-8") as f:
+                fc = json.load(f)
+                for feat in fc.get("features", []):
+                    if feat.get("geometry"):
+                        landslide_shapes.append((shape(feat["geometry"]), feat.get("properties", {})))
+        except Exception as e:
+            print(f"Error reading {landslide_path}: {e}")
+
+    _cached_hazard_shapes = (flood_shapes, landslide_shapes)
+    return _cached_hazard_shapes
+
+
+def get_station_hazard_levels(lat: float, lng: float) -> Tuple[int, int]:
+    """
+    Returns (flood_susceptibility_level, landslide_susceptibility_level)
+    Levels: 0 = Low/None, 1 = Moderate, 2 = High
+    """
+    flood_shapes, landslide_shapes = load_hazard_shapes()
+    pt = Point(float(lng), float(lat))
+
+    flood_level = 0
+    for s, p in flood_shapes:
+        if s.contains(pt) or s.distance(pt) < 0.00045:  # ~50m buffer
+            code = p.get("code")
+            if code == "HF":
+                flood_level = 2
+                break
+            elif code == "MF" and flood_level < 1:
+                flood_level = 1
+
+    landslide_level = 0
+    for s, p in landslide_shapes:
+        if s.contains(pt) or s.distance(pt) < 0.00045:
+            code = p.get("code")
+            if code == "HL":
+                landslide_level = 2
+                break
+            elif code == "ML" and landslide_level < 1:
+                landslide_level = 1
+
+    return flood_level, landslide_level
 
 
 def encode_source_type(source_type_str: str, name_str: str = "") -> int:
+    """Encode water source sanitary protection level into integer code (0 to 3)."""
     combined = f"{source_type_str} {name_str}".lower()
     for key, code in SOURCE_TYPE_MAPPING.items():
         if key in combined:
@@ -54,43 +129,15 @@ def encode_source_type(source_type_str: str, name_str: str = "") -> int:
     return 1  # Default to 1 (Protected Reservoir/Tank)
 
 
-def count_buffer_encroachments(
-    station_coord: Tuple[float, float], hazards: List[Dict[str, Any]], buffer_meters: float = 50.0
-) -> int:
-    """Count how many hazards fall within buffer_meters of the station."""
-    count = 0
-    for h in hazards:
-        geom_type = h.get("geometry_type") or "Point"
-        coords = h.get("coordinates")
-        if not coords:
-            continue
-
-        dist = float("inf")
-        if geom_type == "Point":
-            dist = haversine_distance(station_coord, (coords[0], coords[1]))
-        elif geom_type == "LineString":
-            dist = distance_point_to_linestring(station_coord, coords)
-        elif geom_type == "Polygon":
-            dist = distance_point_to_polygon(station_coord, coords)
-
-        if dist <= buffer_meters:
-            count += 1
-    return count
-
-
-def fetch_raw_data() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Fetch water stations and contamination hazards from Supabase."""
+def fetch_raw_data() -> List[Dict[str, Any]]:
+    """Fetch all physical water monitoring stations from Supabase."""
     client = get_supabase()
     locs_res = client.table("water_locations").select("*").execute()
-    hazards_res = client.table("contamination_hazards").select("*").execute()
-
-    return locs_res.data or [], hazards_res.data or []
+    return locs_res.data or []
 
 
-def build_base_records(
-    locations: List[Dict[str, Any]], hazards: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """Convert DB records to station feature objects with GIS distance calculations."""
+def build_base_records(locations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract spatial hazard parameters and baseline bacteriological test labels."""
     records = []
 
     for loc in locations:
@@ -99,24 +146,31 @@ def build_base_records(
         if lat is None or lng is None:
             continue
 
-        coord = (float(lng), float(lat))
-        dist_dict = calculate_station_hazard_distances(coord, hazards)
-        encroachments = count_buffer_encroachments(coord, hazards, 50.0)
+        try:
+            lat = float(lat)
+            lng = float(lng)
+        except (ValueError, TypeError):
+            continue
 
-        # Baseline ground-truth label from database
+        flood_lvl, landslide_lvl = get_station_hazard_levels(lat, lng)
+
         raw_status = (loc.get("status") or "safe").lower()
         raw_ecoli = loc.get("e_coli")
+        coliform = float(loc.get("coliform_bacteria") or loc.get("coliform_count") or 0)
+        has_ecoli = (
+            raw_ecoli is True
+            or str(raw_ecoli).lower() in ["positive", "present", "true", "1"]
+            or float(loc.get("e_coli_count") or 0) > 0
+        )
         is_unsafe = (
             raw_status in ["undrinkable", "contaminated", "warning"]
-            or raw_ecoli is True
-            or str(raw_ecoli).lower() in ["positive", "present", "true", "1"]
+            or has_ecoli
+            or coliform > 0
         )
         label = 1 if is_unsafe else 0
 
-        station_name = loc.get("full_name") or loc.get("name") or ""
-        source_code = encode_source_type(
-            loc.get("source_type") or "", station_name
-        )
+        station_name = loc.get("full_name") or loc.get("name") or "Water Station"
+        source_code = encode_source_type(loc.get("source_type") or "", station_name)
 
         records.append({
             "id": loc.get("id"),
@@ -125,10 +179,8 @@ def build_base_records(
             "latitude": lat,
             "longitude": lng,
             "source_type_code": source_code,
-            "distance_to_latrine_meters": dist_dict["min_dist_latrine_meters"],
-            "distance_to_river_meters": dist_dict["min_dist_river_meters"],
-            "distance_to_farmland_meters": dist_dict["min_dist_farmland_meters"],
-            "buffer_encroachments_count": encroachments,
+            "flood_susceptibility_level": flood_lvl,
+            "landslide_susceptibility_level": landslide_lvl,
             "baseline_label": label,
         })
 
@@ -139,13 +191,10 @@ def generate_scenario_dataset(
     base_records: List[Dict[str, Any]], random_seed: int = 42
 ) -> pd.DataFrame:
     """
-    Augment baseline stations across 3 meteorological scenarios:
-      1. Dry / Base period (0 - 5 mm rainfall)
-      2. Moderate Monsoon (15 - 45 mm rainfall)
-      3. Severe Storm Runoff (60 - 140 mm rainfall)
-    Applies non-linear domain environmental mechanics:
-      - Saturated soil + close latrine/river significantly elevates microbial transport.
-      - Deep protected pumps & BIS taps resist runoff better than open springs.
+    Augment baseline stations across 3 meteorological and runoff regimes:
+      1. Dry / Base Period (0 - 5 mm rainfall)
+      2. Moderate Monsoon Runoff (15 - 45 mm rainfall)
+      3. Severe Storm Inundation (60 - 140 mm rainfall)
     """
     random.seed(random_seed)
     np.random.seed(random_seed)
@@ -154,30 +203,26 @@ def generate_scenario_dataset(
 
     for station in base_records:
         src_code = station["source_type_code"]
-        dist_latrine = station["distance_to_latrine_meters"]
-        dist_river = station["distance_to_river_meters"]
-        dist_farm = station["distance_to_farmland_meters"]
-        encroachments = station["buffer_encroachments_count"]
+        flood_lvl = station["flood_susceptibility_level"]
+        landslide_lvl = station["landslide_susceptibility_level"]
         base_label = station["baseline_label"]
 
-        # Scenario 1: Dry / Normal (Similar to ground-truth testing conditions in Leyte dry window)
+        # Scenario 1: Dry / Normal Baseline Weather
         for _ in range(2):
             rf_24h = round(float(np.random.uniform(0.0, 5.0)), 1)
             rf_48h = round(rf_24h + float(np.random.uniform(0.0, 8.0)), 1)
             temp = round(float(np.random.uniform(28.0, 33.0)), 1)
             humidity = round(float(np.random.uniform(65.0, 78.0)), 1)
 
-            # In dry periods, label tracks ground truth baseline closely
+            # In dry weather, baseline bacteriological ground truth holds
             label = base_label
-            # Open spring with latrine < 30m remains unsafe even in dry weather
-            if src_code == 0 and dist_latrine < 35:
+            # Unprotected open spring in high hazard zone remains contaminated
+            if src_code == 0 and flood_lvl >= 1 and base_label == 1:
                 label = 1
 
             rows.append({
-                "distance_to_latrine_meters": dist_latrine,
-                "distance_to_river_meters": dist_river,
-                "distance_to_farmland_meters": dist_farm,
-                "buffer_encroachments_count": encroachments,
+                "flood_susceptibility_level": flood_lvl,
+                "landslide_susceptibility_level": landslide_lvl,
                 "rainfall_intensity_mm": rf_24h,
                 "cumulative_48h_rainfall_mm": rf_48h,
                 "temperature_celsius": temp,
@@ -196,23 +241,23 @@ def generate_scenario_dataset(
             temp = round(float(np.random.uniform(25.0, 28.5)), 1)
             humidity = round(float(np.random.uniform(80.0, 92.0)), 1)
 
-            # Moderate rain causes runoff:
-            # Latrine within 75m or River within 50m elevates microbial risk for springs & wells
+            # Rain triggers runoff:
+            # High flood zones (HF=2), high landslide zones (HL=2), and open springs (src=0) contaminate
             elevated = False
             if base_label == 1:
                 elevated = True
-            elif dist_latrine < 80 or dist_river < 60 or encroachments >= 1:
+            elif flood_lvl == 2 or landslide_lvl == 2:
                 elevated = True
-            elif src_code == 0 and (dist_farm < 100 or rf_48h > 50):  # open spring
+            elif src_code == 0 and (flood_lvl >= 1 or rf_48h > 45.0):
+                elevated = True
+            elif src_code == 2 and flood_lvl >= 1 and rf_24h > 35.0:  # shallow well
                 elevated = True
 
             label = 1 if elevated else 0
 
             rows.append({
-                "distance_to_latrine_meters": dist_latrine,
-                "distance_to_river_meters": dist_river,
-                "distance_to_farmland_meters": dist_farm,
-                "buffer_encroachments_count": encroachments,
+                "flood_susceptibility_level": flood_lvl,
+                "landslide_susceptibility_level": landslide_lvl,
                 "rainfall_intensity_mm": rf_24h,
                 "cumulative_48h_rainfall_mm": rf_48h,
                 "temperature_celsius": temp,
@@ -224,36 +269,33 @@ def generate_scenario_dataset(
                 "barangay": station["barangay"],
             })
 
-        # Scenario 3: Severe Tropical Storm / Typhoon Runoff (60 - 150 mm)
+        # Scenario 3: Severe Tropical Storm / Typhoon Inundation (60 - 150 mm)
         for _ in range(2):
             rf_24h = round(float(np.random.uniform(60.0, 130.0)), 1)
             rf_48h = round(rf_24h + float(np.random.uniform(40.0, 90.0)), 1)
             temp = round(float(np.random.uniform(23.0, 26.5)), 1)
             humidity = round(float(np.random.uniform(92.0, 99.0)), 1)
 
-            # High storm runoff:
-            # Most shallow/open systems and stations within 150m of latrines/rivers contaminate
+            # High floodwaters contaminate most vulnerable water infrastructure
             elevated = True
-            # Only highly protected BIS taps and deep wells far from hazards (> 250m) stay safe
-            if src_code == 3 and dist_latrine > 200 and dist_river > 150 and encroachments == 0:
+            # Only sealed Level 3 taps and elevated deep wells outside hazard zones remain protected
+            if src_code == 3 and flood_lvl == 0 and landslide_lvl == 0:
                 elevated = False
-            elif src_code == 2 and dist_latrine > 250 and dist_river > 200:
+            elif src_code == 1 and flood_lvl == 0 and landslide_lvl == 0 and rf_24h < 85.0:
                 elevated = False
 
             label = 1 if elevated else 0
 
             rows.append({
-                "distance_to_latrine_meters": dist_latrine,
-                "distance_to_river_meters": dist_river,
-                "distance_to_farmland_meters": dist_farm,
-                "buffer_encroachments_count": encroachments,
+                "flood_susceptibility_level": flood_lvl,
+                "landslide_susceptibility_level": landslide_lvl,
                 "rainfall_intensity_mm": rf_24h,
                 "cumulative_48h_rainfall_mm": rf_48h,
                 "temperature_celsius": temp,
                 "humidity_percent": humidity,
                 "source_type_code": src_code,
                 "target_unsafe": label,
-                "scenario": "Severe Storm Runoff",
+                "scenario": "Severe Storm Inundation",
                 "station_name": station["name"],
                 "barangay": station["barangay"],
             })
@@ -264,19 +306,21 @@ def generate_scenario_dataset(
 
 def get_training_data() -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """
-    Main loader function: fetches data, calculates spatial metrics, generates augmented dataset.
+    Main loader function: fetches data, calculates spatial hazard metrics, generates augmented dataset.
     Returns: (df, X, y)
     """
-    locations, hazards = fetch_raw_data()
-    print(f"Loaded {len(locations)} stations and {len(hazards)} mapped hazards from Supabase.")
+    locations = fetch_raw_data()
+    print(f"Loaded {len(locations)} stations from Supabase.")
 
-    base_records = build_base_records(locations, hazards)
+    base_records = build_base_records(locations)
     df = generate_scenario_dataset(base_records)
 
     X = df[FEATURE_COLUMNS].values
     y = df["target_unsafe"].values
 
-    print(f"Constructed augmented dataset with {len(df)} rows.")
+    print(f"Constructed augmented dataset with {len(df)} rows using {len(FEATURE_COLUMNS)} features:")
+    for col in FEATURE_COLUMNS:
+        print(f"  • {col}")
     print(f"Class distribution: Safe (0) = {(y == 0).sum()}, Unsafe (1) = {(y == 1).sum()}")
 
     return df, X, y
@@ -284,6 +328,6 @@ def get_training_data() -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
 
 if __name__ == "__main__":
     df, X, y = get_training_data()
-    output_path = os.path.join(CURRENT_DIR, "augmented_water_dataset.csv")
+    output_path = os.path.join(CURRENT_DIR, "water_quality_dataset.csv")
     df.to_csv(output_path, index=False)
     print(f"Saved dataset snapshot to: {output_path}")

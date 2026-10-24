@@ -15,9 +15,9 @@ MODEL_PATH = os.path.join(BACKEND_ROOT, "ml", "water_quality_model.pkl")
 METRICS_PATH = os.path.join(BACKEND_ROOT, "ml", "model_evaluation_metrics.json")
 
 from core.database import get_supabase
-from core.spatial import calculate_station_hazard_distances
 from services.weather_service import get_live_weather
-from ml.dataset import encode_source_type, count_buffer_encroachments, FEATURE_COLUMNS
+from services.push_service import broadcast_push_notification
+from ml.dataset import encode_source_type, get_station_hazard_levels, FEATURE_COLUMNS
 
 _cached_model_payload: Optional[Dict[str, Any]] = None
 
@@ -98,7 +98,7 @@ async def predict_station_risk(
     """
     Perform real-time machine learning inference for a given water station:
     1. Retrieve station coordinates and source type
-    2. Retrieve GIS mapped hazards and calculate proximity distances
+    2. Retrieve official GIS flood and landslide susceptibility levels
     3. Retrieve live local meteorological conditions
     4. Compute model.predict_proba()
     5. Evaluate against configurable thresholds
@@ -115,14 +115,8 @@ async def predict_station_risk(
     station_name = station.get("full_name") or station.get("name") or ""
     barangay = station.get("barangay") or ""
 
-    # Fetch mapped hazards
-    hazards_res = sb.table("contamination_hazards").select("*").execute()
-    hazards = hazards_res.data or []
-
-    # Proximity metrics
-    coord = (lng, lat)
-    dist_dict = calculate_station_hazard_distances(coord, hazards)
-    encroachments = count_buffer_encroachments(coord, hazards, 50.0)
+    # Official GIS hazard susceptibility
+    flood_level, landslide_level = get_station_hazard_levels(lat, lng)
 
     # Weather metrics
     weather_data = await get_live_weather(lat, lng)
@@ -131,15 +125,13 @@ async def predict_station_risk(
     temp = float(weather_data.get("temperature_celsius") or 28.0)
     humidity = float(weather_data.get("humidity_percent") or 75.0)
 
-    # Encode source type
+    # Encode source protection tier
     source_code = encode_source_type(source_type, station_name)
 
     # Prepare feature vector matching FEATURE_COLUMNS
     feature_vector = [
-        dist_dict["min_dist_latrine_meters"],
-        dist_dict["min_dist_river_meters"],
-        dist_dict["min_dist_farmland_meters"],
-        encroachments,
+        flood_level,
+        landslide_level,
         rf_24h,
         rf_48h,
         temp,
@@ -154,7 +146,6 @@ async def predict_station_risk(
 
     pipeline = payload["pipeline"]
     proba = pipeline.predict_proba([feature_vector])[0]
-    # proba[1] is probability of unsafe/contaminated
     risk_score = round(float(proba[1]), 4)
 
     # Load thresholds
@@ -174,20 +165,27 @@ async def predict_station_risk(
     else:
         predicted_status = "undrinkable"
         risk_level = "High (Contaminated)"
-        advisory = "High Contamination Risk: Elevated probability of E. coli infiltration. Precautionary boiling strongly advised."
+        advisory = "High Contamination Risk: Elevated probability of microbial infiltration. Precautionary boiling strongly advised."
 
-    # Identify primary risk contributors
+    # Identify primary risk contributors based on official parameters
     risk_factors = []
-    if dist_dict["min_dist_latrine_meters"] < 50:
-        risk_factors.append(f"Unhygienic latrine within {dist_dict['min_dist_latrine_meters']}m buffer zone")
-    if rf_24h >= 20.0 or rf_48h >= 40.0:
-        risk_factors.append(f"Heavy rainfall ({rf_24h} mm in 24h) inducing surface runoff")
-    if dist_dict["min_dist_river_meters"] < 60:
-        risk_factors.append(f"Proximity to river/drainage canal ({dist_dict['min_dist_river_meters']}m)")
-    if dist_dict["min_dist_farmland_meters"] < 100:
-        risk_factors.append(f"Adjacent agricultural runoff zone ({dist_dict['min_dist_farmland_meters']}m)")
-    if encroachments > 0:
-        risk_factors.append(f"{encroachments} hazardous facilities encroaching within 50m")
+    if flood_level == 2:
+        risk_factors.append("Station is located inside High Flood Susceptibility zone (DENR-MGB)")
+    elif flood_level == 1:
+        risk_factors.append("Station is located inside Moderate Flood Susceptibility zone (DENR-MGB)")
+
+    if landslide_level == 2:
+        risk_factors.append("Station is located inside High Landslide Susceptibility zone (DENR-MGB)")
+    elif landslide_level == 1:
+        risk_factors.append("Station is located inside Moderate Landslide Susceptibility zone (DENR-MGB)")
+
+    if rf_24h >= 15.0 or rf_48h >= 30.0:
+        risk_factors.append(f"Elevated rainfall ({rf_24h} mm in 24h, {rf_48h} mm in 48h) inducing surface runoff")
+
+    if source_code == 0:
+        risk_factors.append("Open spring water source with vulnerable surface intake")
+    elif source_code == 2 and flood_level >= 1:
+        risk_factors.append("Groundwater well head susceptible to flood backwash")
 
     return {
         "station_id": station_id,
@@ -204,10 +202,10 @@ async def predict_station_risk(
             "high_cutoff": threshold_high,
         },
         "environmental_metrics": {
-            "distance_to_latrine_meters": dist_dict["min_dist_latrine_meters"],
-            "distance_to_river_meters": dist_dict["min_dist_river_meters"],
-            "distance_to_farmland_meters": dist_dict["min_dist_farmland_meters"],
-            "buffer_encroachments_count": encroachments,
+            "flood_susceptibility_level": flood_level,
+            "flood_susceptibility_label": "High" if flood_level == 2 else ("Moderate" if flood_level == 1 else "Low/None"),
+            "landslide_susceptibility_level": landslide_level,
+            "landslide_susceptibility_label": "High" if landslide_level == 2 else ("Moderate" if landslide_level == 1 else "Low/None"),
             "rainfall_24h_mm": rf_24h,
             "rainfall_48h_mm": rf_48h,
             "temperature_celsius": temp,
@@ -248,5 +246,152 @@ async def predict_all_stations(
         "summary": summary,
         "results": results,
         "total_evaluated": len(results),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+async def run_barangay_surveillance_and_alert(
+    barangay: Optional[str] = None,
+    notify_residents: bool = True,
+    custom_threshold_low: Optional[float] = None,
+    custom_threshold_high: Optional[float] = None,
+    current_user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run machine learning risk surveillance across water stations in a selected barangay (or all barangays).
+    If any station crosses warning or contaminated risk thresholds, automatically dispatch
+    in-app advisory notifications and Web Push notifications to subscribed residents.
+    """
+    sb = get_supabase()
+    query = sb.table("water_locations").select("id, full_name, barangay, latitude, longitude, status")
+
+    target_b = (barangay or "").strip()
+    if target_b and target_b.lower() not in ("all", "all barangays", "city-wide", ""):
+        query = query.ilike("barangay", target_b)
+
+    locs_res = query.execute()
+    stations = locs_res.data or []
+
+    results = []
+    summary = {
+        "total": len(stations),
+        "safe": 0,
+        "warning": 0,
+        "undrinkable": 0,
+    }
+    flagged_by_barangay: Dict[str, List[Dict[str, Any]]] = {}
+
+    for s in stations:
+        try:
+            pred = await predict_station_risk(
+                s["id"], custom_threshold_low, custom_threshold_high
+            )
+            results.append(pred)
+            status = pred.get("predicted_status", "safe")
+            if status in summary:
+                summary[status] += 1
+
+            if status in ("warning", "undrinkable"):
+                b_name = pred.get("barangay") or s.get("barangay") or "Maasin City"
+                if b_name not in flagged_by_barangay:
+                    flagged_by_barangay[b_name] = []
+                flagged_by_barangay[b_name].append(pred)
+        except Exception as e:
+            logger.error(f"Error evaluating station {s.get('id')}: {e}")
+
+    flagged_total = summary["warning"] + summary["undrinkable"]
+    notifications_created = []
+    push_summary = {"total_sent": 0, "total_failed": 0}
+
+    # Dispatch alerts if requested and flagged stations were found
+    if notify_residents and flagged_by_barangay:
+        for b_name, flagged_list in flagged_by_barangay.items():
+            try:
+                contaminated_items = [st for st in flagged_list if st.get("predicted_status") == "undrinkable"]
+                warning_items = [st for st in flagged_list if st.get("predicted_status") == "warning"]
+                max_risk = max([st.get("risk_percentage", 0) for st in flagged_list]) if flagged_list else 0
+
+                is_critical = len(contaminated_items) > 0
+                notif_type = "critical" if is_critical else "warning"
+
+                station_names = [st.get("station_name", "Water Station") for st in flagged_list[:3]]
+                names_summary = ", ".join(station_names)
+                if len(flagged_list) > 3:
+                    names_summary += f" and {len(flagged_list) - 3} other(s)"
+
+                if is_critical:
+                    title = f"🚨 Water Quality Alert: Contamination Risk in Brgy. {b_name}"
+                    message = (
+                        f"Machine learning surveillance detected high contamination probability (peak {max_risk}%) "
+                        f"for {len(flagged_list)} station(s) including {names_summary}. Precautionary water boiling is strongly advised."
+                    )
+                else:
+                    title = f"⚠️ Water Safety Advisory: Elevated Runoff Risk in Brgy. {b_name}"
+                    message = (
+                        f"Machine learning surveillance detected elevated runoff risk (peak {max_risk}%) "
+                        f"for {len(flagged_list)} station(s) including {names_summary}. Please inspect water clarity before drinking."
+                    )
+
+                new_notif = {
+                    "title": title,
+                    "message": message,
+                    "type": notif_type,
+                    "barangay": b_name,
+                    "target_roles": ["resident", "barangay_official"],
+                    "created_by": current_user_id or "00000000-0000-0000-0000-000000000000",
+                }
+                insert_res = sb.table("notifications").insert(new_notif).execute()
+                notif_record = insert_res.data[0] if insert_res.data else new_notif
+                notifications_created.append(notif_record)
+
+                # Send Web Push
+                push_res = await broadcast_push_notification(
+                    title=f"WaterWatch: {title}",
+                    message=message,
+                    barangay=b_name,
+                    url="/portal/notifications",
+                    tag=f"ml-scan-{b_name.lower().replace(' ', '-')}",
+                )
+                sent_count = push_res.get("sent", 0) if isinstance(push_res, dict) else 0
+                push_summary["total_sent"] += sent_count
+                push_summary["total_failed"] += push_res.get("failed", 0) if isinstance(push_res, dict) else 0
+                notif_record["pushed_count"] = sent_count
+                notif_record["pushed_residents_count"] = sent_count
+                notif_record["body"] = message
+            except Exception as notif_err:
+                logger.error(f"Error creating notification for barangay {b_name}: {notif_err}")
+
+    return {
+        "barangay": target_b or "all",
+        "total_evaluated": len(results),
+        "evaluated_stations": len(results),
+        "summary": summary,
+        "safe_count": summary.get("safe", 0),
+        "warning_count": summary.get("warning", 0),
+        "contaminated_count": summary.get("undrinkable", 0),
+        "flagged_total": flagged_total,
+        "flagged_count": flagged_total,
+        "notifications_count": len(notifications_created),
+        "notifications_dispatched": notifications_created,
+        "notifications": notifications_created,
+        "push_stats": push_summary,
+        "flagged_stations": [
+            {
+                "id": st["station_id"],
+                "station_id": st["station_id"],
+                "name": st["station_name"],
+                "station_name": st["station_name"],
+                "barangay": st["barangay"],
+                "risk_percentage": st["risk_percentage"],
+                "predicted_status": st["predicted_status"],
+                "status": st["predicted_status"],
+                "risk_level": st["risk_level"],
+                "risk_factors": st.get("risk_factors", []),
+                "advisory": st.get("advisory", ""),
+            }
+            for b_list in flagged_by_barangay.values()
+            for st in b_list
+        ],
+        "results": results,
         "timestamp": datetime.now().isoformat(),
     }

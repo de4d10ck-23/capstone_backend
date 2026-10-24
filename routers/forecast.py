@@ -10,6 +10,7 @@ from services.forecast_service import (
     predict_station_risk,
     predict_all_stations,
     load_model_payload,
+    run_barangay_surveillance_and_alert,
 )
 from services.heatmap_service import (
     get_heatmaps_data,
@@ -141,6 +142,34 @@ async def run_batch_predictions(
     except Exception as e:
         logger.error(f"Batch prediction error: {e}")
         raise HTTPException(status_code=500, detail=f"Batch evaluation error: {str(e)}")
+
+
+@router.post("/run-surveillance")
+async def run_surveillance_endpoint(
+    current_user: Annotated[dict, Depends(require_admin)],
+    barangay: Optional[str] = Query(None, description="Target barangay or 'all'"),
+    notify_residents: bool = Query(True, description="Whether to send push notification to residents if risk is flagged"),
+    threshold_low: Optional[float] = Query(None, description="Optional override for low risk threshold"),
+    threshold_high: Optional[float] = Query(None, description="Optional override for high risk threshold"),
+):
+    """
+    On-demand manual trigger to execute machine learning risk surveillance 
+    across all water stations in a selected barangay (or all barangays).
+    If any station crosses warning or contamination risk thresholds, 
+    automatically dispatches in-app notifications and Web Push alerts to residents.
+    """
+    try:
+        results = await run_barangay_surveillance_and_alert(
+            barangay=barangay,
+            notify_residents=notify_residents,
+            custom_threshold_low=threshold_low,
+            custom_threshold_high=threshold_high,
+            current_user_id=current_user.get("id"),
+        )
+        return {"success": True, "data": results}
+    except Exception as e:
+        logger.error(f"Error in on-demand surveillance: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Surveillance run failed: {str(e)}")
 
 
 @router.get("/heatmaps")

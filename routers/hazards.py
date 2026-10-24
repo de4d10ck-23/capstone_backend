@@ -17,6 +17,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/hazards", tags=["Contamination Hazards"])
 
 
+@router.get("/environmental-layers")
+async def get_environmental_hazard_layers():
+    """
+    Return the official Maasin Flood and Landslide Hazard Susceptibility layers
+    derived from official DENR-MGB / Study Area GIS datasets in Maasin_LandFlood.
+    """
+    from services.heatmap_service import load_official_hazard_datasets
+    flood_data, landslide_data = load_official_hazard_datasets()
+    return {
+        "success": True,
+        "flood_hazards": flood_data,
+        "landslide_hazards": landslide_data,
+        "summary": {
+            "flood_features": len(flood_data.get("features", [])),
+            "landslide_features": len(landslide_data.get("features", [])),
+        }
+    }
+
+
 @router.get("/proximity")
 async def get_hazard_proximity(
     lat: float = Query(...),

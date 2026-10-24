@@ -1,20 +1,30 @@
 import os
+import json
 import math
 import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
+import shapely.geometry
+from shapely.geometry import shape, Point
+
 from core.database import get_supabase
-from core.spatial import haversine_distance, calculate_station_hazard_distances
-from ml.dataset import encode_source_type, count_buffer_encroachments
+from core.spatial import haversine_distance
+from ml.dataset import encode_source_type, get_station_hazard_levels
 from services.forecast_service import load_model_payload, get_active_config
 from services.weather_service import get_live_weather, MAASIN_DEFAULT_LAT, MAASIN_DEFAULT_LNG
 
 logger = logging.getLogger(__name__)
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_ROOT = os.path.dirname(CURRENT_DIR)
+DATA_DIR = os.path.join(BACKEND_ROOT, "data")
+
 # In-memory cache for computed heatmaps
 _heatmap_cache: Dict[str, Any] = {
+    "flood_hazards": {"type": "FeatureCollection", "features": []},
+    "landslide_hazards": {"type": "FeatureCollection", "features": []},
     "hazard_heatmap": {"type": "FeatureCollection", "features": []},
     "water_contamination_heatmap": {"type": "FeatureCollection", "features": []},
     "last_updated": None,
@@ -26,10 +36,37 @@ _heatmap_cache: Dict[str, Any] = {
         "contaminated_stations": 0,
         "warning_stations": 0,
         "safe_stations": 0,
+        "flood_zones": 0,
+        "landslide_zones": 0,
     },
 }
 
 _scheduler_task: Optional[asyncio.Task] = None
+
+
+def load_official_hazard_datasets() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load pre-processed official flood and landslide GeoJSONs derived from Maasin_LandFlood."""
+    flood_path = os.path.join(DATA_DIR, "maasin_flood_hazards.json")
+    landslide_path = os.path.join(DATA_DIR, "maasin_landslide_hazards.json")
+
+    flood_data = {"type": "FeatureCollection", "features": []}
+    landslide_data = {"type": "FeatureCollection", "features": []}
+
+    if os.path.exists(flood_path):
+        try:
+            with open(flood_path, "r", encoding="utf-8") as f:
+                flood_data = json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load {flood_path}: {e}")
+
+    if os.path.exists(landslide_path):
+        try:
+            with open(landslide_path, "r", encoding="utf-8") as f:
+                landslide_data = json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load {landslide_path}: {e}")
+
+    return flood_data, landslide_data
 
 
 def densify_line(coords: List[List[float]], step_meters: float = 30.0) -> List[Tuple[float, float]]:
@@ -118,79 +155,35 @@ def get_hazard_risk_weight(risk_level: str, hazard_type: str) -> float:
 
 async def generate_hazard_heatmap_geojson() -> Dict[str, Any]:
     """
-    Generate GeoJSON Point FeatureCollection representing all contamination hazards
-    (points, lines, and polygons densified into weighted heat points).
+    Generate unified GeoJSON FeatureCollection representing official Maasin Flood and Landslide
+    hazard susceptibility zones loaded from Maasin_LandFlood (DENR-MGB official study area).
     """
-    sb = get_supabase()
-    try:
-        res = sb.table("contamination_hazards").select("*").execute()
-        hazards = res.data or []
-    except Exception as e:
-        logger.warning(f"Error loading hazards for heatmap: {e}")
-        hazards = []
+    flood_data, landslide_data = load_official_hazard_datasets()
+    combined_features = []
 
-    features = []
-    for h in hazards:
-        geom_type = (h.get("geometry_type") or "Point").lower()
-        coords = h.get("coordinates")
-        if not coords:
-            continue
+    for f in flood_data.get("features", []):
+        combined_features.append(f)
 
-        weight = get_hazard_risk_weight(h.get("risk_level"), h.get("hazard_type"))
-        base_props = {
-            "hazard_id": h.get("id"),
-            "name": h.get("name"),
-            "hazard_type": h.get("hazard_type"),
-            "risk_level": h.get("risk_level"),
-            "barangay": h.get("barangay"),
-            "weight": weight,
-        }
-
-        if geom_type == "point":
-            if isinstance(coords, list) and len(coords) >= 2:
-                features.append({
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [float(coords[0]), float(coords[1])],
-                    },
-                    "properties": {**base_props, "source_geometry": "Point"},
-                })
-
-        elif "line" in geom_type:
-            sampled = densify_line(coords, step_meters=35.0)
-            for pt in sampled:
-                features.append({
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [pt[0], pt[1]],
-                    },
-                    "properties": {**base_props, "source_geometry": "LineString"},
-                })
-
-        elif "polygon" in geom_type:
-            sampled = densify_polygon(coords, step_meters=45.0)
-            for pt in sampled:
-                features.append({
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [pt[0], pt[1]],
-                    },
-                    "properties": {**base_props, "source_geometry": "Polygon"},
-                })
+    for f in landslide_data.get("features", []):
+        combined_features.append(f)
 
     return {
         "type": "FeatureCollection",
-        "features": features,
+        "metadata": {
+            "source": "Maasin_LandFlood (DENR-MGB Study Area)",
+            "total_flood_zones": len(flood_data.get("features", [])),
+            "total_landslide_zones": len(landslide_data.get("features", [])),
+            "total_features": len(combined_features),
+        },
+        "features": combined_features,
     }
 
 
 async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any], Dict[str, int]]:
     """
     Generate GeoJSON Point FeatureCollection representing microbial and ML contamination
-    risk across all monitored water locations using high-performance vectorized batch inference.
+    risk across all monitored water locations using high-performance vectorized batch inference
+    augmented with official spatial hazard zone vulnerability weighting.
     """
     sb = get_supabase()
     try:
@@ -206,6 +199,24 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
     except Exception as e:
         logger.warning(f"Error loading hazards for heatmap: {e}")
         hazards = []
+
+    # Load official GIS hazard geometries for spatial vulnerability intersection
+    flood_data, landslide_data = load_official_hazard_datasets()
+    flood_shapes = []
+    for f in flood_data.get("features", []):
+        if f.get("geometry"):
+            try:
+                flood_shapes.append((shape(f["geometry"]), f.get("properties", {})))
+            except Exception as e:
+                logger.debug(f"Invalid flood geometry: {e}")
+
+    landslide_shapes = []
+    for f in landslide_data.get("features", []):
+        if f.get("geometry"):
+            try:
+                landslide_shapes.append((shape(f["geometry"]), f.get("properties", {})))
+            except Exception as e:
+                logger.debug(f"Invalid landslide geometry: {e}")
 
     # Get regional weather once for inference
     weather_data = await get_live_weather(MAASIN_DEFAULT_LAT, MAASIN_DEFAULT_LNG)
@@ -235,23 +246,39 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
         except (ValueError, TypeError):
             continue
 
-        coord = (lng, lat)
-        dist_dict = calculate_station_hazard_distances(coord, hazards)
-        encroachments = count_buffer_encroachments(coord, hazards, 50.0)
-        source_code = encode_source_type(loc.get("source_type") or "", loc.get("name") or loc.get("full_name") or "")
+        pt = Point(lng, lat)
+        flood_lvl = 0
+        for s, p in flood_shapes:
+            if s.contains(pt) or s.distance(pt) < 0.00045:
+                code = p.get("code")
+                if code == "HF":
+                    flood_lvl = 2
+                    break
+                elif code == "MF" and flood_lvl < 1:
+                    flood_lvl = 1
+
+        landslide_lvl = 0
+        for s, p in landslide_shapes:
+            if s.contains(pt) or s.distance(pt) < 0.00045:
+                code = p.get("code")
+                if code == "HL":
+                    landslide_lvl = 2
+                    break
+                elif code == "ML" and landslide_lvl < 1:
+                    landslide_lvl = 1
+
+        source_code = encode_source_type(loc.get("source_type") or "", loc.get("full_name") or loc.get("name") or "")
 
         vec = [
-            dist_dict["min_dist_latrine_meters"],
-            dist_dict["min_dist_river_meters"],
-            dist_dict["min_dist_farmland_meters"],
-            encroachments,
+            flood_lvl,
+            landslide_lvl,
             rf_24h,
             rf_48h,
             temp,
             humidity,
             source_code,
         ]
-        valid_locs.append((loc, lng, lat, dist_dict, encroachments))
+        valid_locs.append((loc, lng, lat, flood_lvl, landslide_lvl))
         feature_vectors.append(vec)
 
     # Batch inference
@@ -269,8 +296,60 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
     features = []
     stats = {"safe": 0, "warning": 0, "undrinkable": 0, "total": len(valid_locs)}
 
-    for i, (loc, lng, lat, dist_dict, encroachments) in enumerate(valid_locs):
-        risk_prob = round(probabilities[i], 4) if i < len(probabilities) else 0.1
+    # Evaluate each station with official environmental hazard vulnerability weighting
+    for i, (loc, lng, lat, flood_lvl, landslide_lvl) in enumerate(valid_locs):
+        base_prob = round(probabilities[i], 4) if i < len(probabilities) else 0.1
+        pt = Point(lng, lat)
+
+        # Check intersection with official flood susceptibility zones (~50m buffer)
+        in_flood = None
+        for s, p in flood_shapes:
+            if s.contains(pt) or s.distance(pt) < 0.00045:
+                in_flood = p
+                break
+
+        # Check intersection with official landslide susceptibility zones (~50m buffer)
+        in_landslide = None
+        for s, p in landslide_shapes:
+            if s.contains(pt) or s.distance(pt) < 0.00045:
+                in_landslide = p
+                break
+
+        # Calculate hazard vulnerability weight multiplier
+        hazard_multiplier = 1.0
+        hazard_factors = []
+
+        if in_flood:
+            code = in_flood.get("code", "")
+            if code == "HF":
+                hazard_multiplier += 0.30
+                hazard_factors.append("High Flood Susceptibility")
+            elif code == "MF":
+                hazard_multiplier += 0.15
+                hazard_factors.append("Moderate Flood Susceptibility")
+            else:
+                hazard_multiplier += 0.05
+                hazard_factors.append("Low Flood Susceptibility")
+
+        if in_landslide:
+            code = in_landslide.get("code", "")
+            if code == "HL":
+                hazard_multiplier += 0.25
+                hazard_factors.append("High Landslide Susceptibility")
+            elif code == "ML":
+                hazard_multiplier += 0.12
+                hazard_factors.append("Moderate Landslide Susceptibility")
+
+        # Environmental weighting amplifies risk during rain/runoff events
+        vulnerability_weight = round(hazard_multiplier - 1.0, 3)
+        if rf_24h > 1.0 or rf_48h > 3.0:
+            risk_prob = min(0.99, base_prob * hazard_multiplier)
+        elif vulnerability_weight > 0.1:
+            risk_prob = min(0.99, base_prob * (1.0 + vulnerability_weight * 0.5))
+        else:
+            risk_prob = base_prob
+
+        risk_prob = round(risk_prob, 4)
 
         if risk_prob < thresh_low:
             predicted_status = "safe"
@@ -281,8 +360,8 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
 
         stats[predicted_status] += 1
 
-        coliform = float(loc.get("coliform_count") or 0)
-        e_coli = float(loc.get("e_coli_count") or 0)
+        coliform = float(loc.get("coliform_bacteria") or loc.get("coliform_count") or 0)
+        e_coli = float(loc.get("e_coli") or loc.get("e_coli_count") or 0)
         has_bacteria = coliform > 0 or e_coli > 0
 
         if predicted_status == "undrinkable":
@@ -290,7 +369,6 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
         elif predicted_status == "warning":
             heat_weight = max(0.45, risk_prob)
         else:
-            # Safe water sources emit minimal heat so contamination hotspots stand out
             heat_weight = max(0.02, min(0.20, risk_prob * 0.25))
 
         if has_bacteria and heat_weight < 0.7:
@@ -304,10 +382,17 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
             },
             "properties": {
                 "station_id": loc.get("id"),
-                "name": loc.get("name") or loc.get("full_name"),
+                "name": loc.get("full_name") or loc.get("name") or "Water Station",
                 "barangay": loc.get("barangay"),
                 "status": predicted_status,
+                "base_probability": base_prob,
                 "risk_probability": risk_prob,
+                "vulnerability_multiplier": round(hazard_multiplier, 2),
+                "vulnerability_factors": hazard_factors,
+                "in_flood_zone": in_flood is not None,
+                "flood_risk_level": in_flood.get("risk_level", "None") if in_flood else "None",
+                "in_landslide_zone": in_landslide is not None,
+                "landslide_risk_level": in_landslide.get("risk_level", "None") if in_landslide else "None",
                 "coliform_count": coliform,
                 "e_coli_count": e_coli,
                 "weight": round(heat_weight, 4),
@@ -323,7 +408,7 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
 
 async def recompute_heatmaps(triggered_by: str = "schedule") -> Dict[str, Any]:
     """
-    Full recalculation of both Hazard Heatmap and Water Contamination Heatmap.
+    Full recalculation of official Environmental Hazard Layers and Water Contamination Heatmap.
     Updates the in-memory cache and returns metadata.
     """
     global _heatmap_cache
@@ -336,12 +421,15 @@ async def recompute_heatmaps(triggered_by: str = "schedule") -> Dict[str, Any]:
     logger.info(f"Starting heatmap computation (triggered by: {triggered_by}) at {start_time.isoformat()}...")
 
     try:
+        flood_data, landslide_data = load_official_hazard_datasets()
         hazard_geojson = await generate_hazard_heatmap_geojson()
         water_geojson, stats = await generate_water_contamination_heatmap_geojson()
 
         now = datetime.now()
         next_run = now + timedelta(hours=1)
 
+        _heatmap_cache["flood_hazards"] = flood_data
+        _heatmap_cache["landslide_hazards"] = landslide_data
         _heatmap_cache["hazard_heatmap"] = hazard_geojson
         _heatmap_cache["water_contamination_heatmap"] = water_geojson
         _heatmap_cache["last_updated"] = now.isoformat()
@@ -352,11 +440,14 @@ async def recompute_heatmaps(triggered_by: str = "schedule") -> Dict[str, Any]:
             "contaminated_stations": stats.get("undrinkable", 0),
             "warning_stations": stats.get("warning", 0),
             "safe_stations": stats.get("safe", 0),
+            "flood_zones": len(flood_data.get("features", [])),
+            "landslide_zones": len(landslide_data.get("features", [])),
             "triggered_by": triggered_by,
         }
         logger.info(
             f"Heatmap computation completed in {(datetime.now() - start_time).total_seconds():.2f}s: "
-            f"{_heatmap_cache['summary']['total_hazard_points']} hazard points, "
+            f"{_heatmap_cache['summary']['flood_zones']} flood zones, "
+            f"{_heatmap_cache['summary']['landslide_zones']} landslide zones, "
             f"{_heatmap_cache['summary']['total_water_stations']} water stations evaluated."
         )
     except Exception as e:
