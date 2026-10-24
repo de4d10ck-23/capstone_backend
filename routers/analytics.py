@@ -34,20 +34,22 @@ async def get_overview(
         coliform = loc.get("coliform_bacteria")
         e_coli = loc.get("e_coli")
 
+        status = (loc.get("status") or "").strip().lower()
+
         if mode == "qualitative":
-            if exam == "passed":
+            if exam == "passed" or status == "safe":
                 safe += 1
-            elif exam == "failed":
+            elif exam == "failed" or status in ["undrinkable", "contaminated"]:
                 undrinkable += 1
             else:
                 not_tested += 1
         else:
-            if coliform is False and e_coli is False:
-                safe += 1
-            elif coliform is True and e_coli is False:
-                warning += 1
-            elif e_coli is True:
+            if status in ["undrinkable", "contaminated"] or e_coli is True:
                 undrinkable += 1
+            elif status == "warning" or (coliform is True and e_coli is False):
+                warning += 1
+            elif status == "safe" or (coliform is False and e_coli is False):
+                safe += 1
             elif coliform is None and e_coli is None:
                 not_tested += 1
 
@@ -59,9 +61,17 @@ async def get_overview(
 
     # High risk households (near contaminated sources)
     if mode == "qualitative":
-        contaminated = [l for l in all_locs if (l.get("bacteriological_exam") or "").lower() == "failed"]
+        contaminated = [
+            l for l in all_locs
+            if (l.get("bacteriological_exam") or "").lower() == "failed"
+            or (l.get("status") or "").lower() in ["undrinkable", "contaminated"]
+        ]
     else:
-        contaminated = [l for l in all_locs if l.get("e_coli") is True]
+        contaminated = [
+            l for l in all_locs
+            if l.get("e_coli") is True
+            or (l.get("status") or "").lower() in ["undrinkable", "contaminated"]
+        ]
 
     high_risk_households = 0
     for source in contaminated:
