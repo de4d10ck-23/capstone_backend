@@ -13,6 +13,11 @@ from services.push_service import (
     remove_push_subscription,
     broadcast_push_notification,
 )
+from services.notification_service import (
+    mark_notification_read,
+    mark_all_notifications_read,
+    enrich_notifications_with_read_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +82,7 @@ async def list_notifications(
     barangay: str | None = None,
     current_user: Annotated[dict | None, Depends(get_optional_user)] = None,
 ):
-    """Get notifications for the current user based on their role and barangay."""
+    """Get notifications for the current user based on their role and barangay, enriched with persistent read status."""
     sb = get_supabase()
     query = sb.table("notifications").select("*").order("created_at", desc=True)
 
@@ -87,7 +92,42 @@ async def list_notifications(
         query = query.or_(f"barangay.eq.{barangay},barangay.is.null")
         
     result = query.execute()
-    return {"success": True, "data": result.data or []}
+    raw_data = result.data or []
+
+    # Enrich each notification with persistent is_read status
+    user_id = current_user.get("id") if current_user else None
+    enriched = enrich_notifications_with_read_status(raw_data, user_id)
+    unread_count = sum(1 for n in enriched if not n.get("is_read"))
+
+    return {
+        "success": True,
+        "data": enriched,
+        "unread_count": unread_count,
+        "total_count": len(enriched)
+    }
+
+
+@router.get("/unread-count", include_in_schema=False)
+@router.get("/unread-count/")
+async def get_unread_count(
+    barangay: str | None = None,
+    current_user: Annotated[dict | None, Depends(get_optional_user)] = None,
+):
+    """Retrieve exact unread notification count for synchronization across mobile and web headers."""
+    if not current_user:
+        return {"success": True, "unread_count": 0}
+
+    sb = get_supabase()
+    query = sb.table("notifications").select("id,created_at,barangay")
+    if current_user.get("role") in ("barangay_official", "resident") and current_user.get("barangay"):
+        query = query.or_(f"barangay.eq.{current_user['barangay']},barangay.is.null")
+    elif barangay:
+        query = query.or_(f"barangay.eq.{barangay},barangay.is.null")
+
+    result = query.execute()
+    enriched = enrich_notifications_with_read_status(result.data or [], current_user.get("id"))
+    unread_count = sum(1 for n in enriched if not n.get("is_read"))
+    return {"success": True, "unread_count": unread_count}
 
 
 @router.post("", include_in_schema=False)
@@ -142,8 +182,15 @@ async def create_notification(
 async def mark_all_read(
     current_user: Annotated[dict, Depends(get_current_user)]
 ):
-    """Mark all notifications as read for current user."""
-    return {"success": True, "message": "All notifications marked as read"}
+    """Mark all notifications as read for current user in database (syncs across phone and PC)."""
+    sb = get_supabase()
+    query = sb.table("notifications").select("id,created_at")
+    if current_user.get("role") in ("barangay_official", "resident") and current_user.get("barangay"):
+        query = query.or_(f"barangay.eq.{current_user['barangay']},barangay.is.null")
+    result = query.execute()
+
+    mark_all_notifications_read(current_user["id"], result.data or [])
+    return {"success": True, "message": "All notifications marked as read across all devices", "unread_count": 0}
 
 
 @router.put("/{notification_id}/read", include_in_schema=False)
@@ -152,8 +199,9 @@ async def mark_read(
     notification_id: str,
     current_user: Annotated[dict, Depends(get_current_user)]
 ):
-    """Mark a notification as read for the current user."""
-    return {"success": True, "message": "Notification marked as read"}
+    """Mark a notification as read for current user in database (syncs across phone and PC)."""
+    mark_notification_read(current_user["id"], notification_id)
+    return {"success": True, "message": "Notification marked as read across all devices"}
 
 
 @router.delete("/{notification_id}", include_in_schema=False)

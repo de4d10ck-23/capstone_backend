@@ -187,3 +187,12 @@ CREATE TABLE IF NOT EXISTS water_status_logs (
     recorded_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW())
 );
 CREATE INDEX IF NOT EXISTS idx_water_status_logs_location ON water_status_logs(location_id, recorded_at DESC);
+
+-- Table: notification_reads (Tracks persistent user read status across all client devices)
+CREATE TABLE IF NOT EXISTS notification_reads (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    read_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()),
+    PRIMARY KEY (user_id, notification_id)
+);
+CREATE INDEX IF NOT EXISTS idx_notification_reads_user ON notification_reads(user_id);
