@@ -10,6 +10,7 @@ import shapely.geometry
 from shapely.geometry import shape, Point
 
 from core.database import get_supabase
+from core.constants import get_barangay_population, MAX_BARANGAY_POPULATION
 from core.spatial import haversine_distance
 from ml.dataset import encode_source_type, get_station_hazard_levels
 from services.forecast_service import load_model_payload, get_active_config
@@ -42,6 +43,68 @@ _heatmap_cache: Dict[str, Any] = {
 }
 
 _scheduler_task: Optional[asyncio.Task] = None
+_reschedule_event: Optional[asyncio.Event] = None
+_last_run_attempt: Optional[datetime] = None
+_last_alert_run: Optional[Dict[str, Any]] = None
+ALERT_HISTORY_PATH = os.path.join(DATA_DIR, "alert_run_history.json")
+
+# Configurable background model re-run interval (minutes)
+SCHEDULER_SETTINGS_PATH = os.path.join(DATA_DIR, "scheduler_settings.json")
+DEFAULT_INTERVAL_MINUTES = 60
+MIN_INTERVAL_MINUTES = 1
+MAX_INTERVAL_MINUTES = 1440  # 24 hours
+
+
+def get_run_interval_minutes() -> int:
+    """Read the configured scheduler interval (minutes) from disk, falling back to default."""
+    try:
+        if os.path.exists(SCHEDULER_SETTINGS_PATH):
+            with open(SCHEDULER_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                val = int(json.load(f).get("run_interval_minutes", DEFAULT_INTERVAL_MINUTES))
+                return max(MIN_INTERVAL_MINUTES, min(MAX_INTERVAL_MINUTES, val))
+    except Exception as e:
+        logger.warning(f"Could not read scheduler settings: {e}")
+    return DEFAULT_INTERVAL_MINUTES
+
+
+def set_run_interval_minutes(minutes: int) -> int:
+    """Persist a new scheduler interval and wake the worker so it reschedules immediately."""
+    minutes = int(minutes)
+    if minutes < MIN_INTERVAL_MINUTES or minutes > MAX_INTERVAL_MINUTES:
+        raise ValueError(
+            f"Interval must be between {MIN_INTERVAL_MINUTES} and {MAX_INTERVAL_MINUTES} minutes."
+        )
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SCHEDULER_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"run_interval_minutes": minutes}, f, indent=2)
+
+    # Recalculate next_run from the last run using the new interval
+    if _heatmap_cache.get("last_updated"):
+        try:
+            last = datetime.fromisoformat(_heatmap_cache["last_updated"])
+            _heatmap_cache["next_run"] = (last + timedelta(minutes=minutes)).isoformat()
+        except Exception:
+            pass
+    _heatmap_cache["run_interval_minutes"] = minutes
+
+    if _reschedule_event is not None:
+        _reschedule_event.set()
+    logger.info(f"Background model re-run interval updated to {minutes} minute(s).")
+    return minutes
+
+
+def get_scheduler_status() -> Dict[str, Any]:
+    """Return scheduler interval and timing info."""
+    return {
+        "run_interval_minutes": get_run_interval_minutes(),
+        "min_interval_minutes": MIN_INTERVAL_MINUTES,
+        "max_interval_minutes": MAX_INTERVAL_MINUTES,
+        "last_updated": _heatmap_cache.get("last_updated"),
+        "next_run": _heatmap_cache.get("next_run"),
+        "is_updating": _heatmap_cache.get("is_updating", False),
+        "is_running": _scheduler_task is not None and not _scheduler_task.done(),
+        "last_alert_run": _last_alert_run,
+    }
 
 
 def load_official_hazard_datasets() -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -351,28 +414,49 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
 
         risk_prob = round(risk_prob, 4)
 
-        if risk_prob < thresh_low:
-            predicted_status = "safe"
-        elif risk_prob <= thresh_high:
-            predicted_status = "warning"
+        # DIRECT SANITATION INSPECTOR STATUS:
+        # Ground-truth status recorded by sanitation inspector and certified laboratory exams
+        raw_status = (loc.get("status") or "").strip().lower()
+        exam = (loc.get("bacteriological_exam") or "").strip().lower()
+
+        coliform_val = loc.get("coliform_bacteria") if loc.get("coliform_bacteria") is not None else loc.get("coliform_count")
+        e_coli_val = loc.get("e_coli") if loc.get("e_coli") is not None else loc.get("e_coli_count")
+        has_coliform = coliform_val is True or (isinstance(coliform_val, (int, float)) and coliform_val > 0)
+        has_ecoli = e_coli_val is True or (isinstance(e_coli_val, (int, float)) and e_coli_val > 0)
+
+        if raw_status in ("contaminated", "undrinkable") or exam == "failed" or has_ecoli:
+            final_status = "undrinkable"
+        elif raw_status == "warning" or has_coliform:
+            final_status = "warning"
+        elif raw_status == "safe" or exam == "passed":
+            final_status = "safe"
         else:
-            predicted_status = "undrinkable"
+            final_status = "safe"
 
-        stats[predicted_status] += 1
+        stats[final_status] += 1
 
-        coliform = float(loc.get("coliform_bacteria") or loc.get("coliform_count") or 0)
-        e_coli = float(loc.get("e_coli") or loc.get("e_coli_count") or 0)
-        has_bacteria = coliform > 0 or e_coli > 0
+        # Barangay Population Exposure Weighting
+        bgy = loc.get("barangay")
+        bgy_pop = get_barangay_population(bgy)
+        # Normalized population factor (ranges from ~0.04 in Santa Rosa to 1.0 in Combado)
+        pop_factor = min(1.0, max(0.04, bgy_pop / float(MAX_BARANGAY_POPULATION)))
 
-        if predicted_status == "undrinkable":
-            heat_weight = max(0.85, risk_prob)
-        elif predicted_status == "warning":
-            heat_weight = max(0.45, risk_prob)
+        # Heat intensity and plume size strictly driven by Inspector Status + Barangay Population
+        if final_status == "undrinkable":
+            # Inspector verified contaminated: intense crimson (0.75 - 1.0) and broad plume (150m - 400m)
+            heat_weight = min(1.0, 0.75 + (0.25 * pop_factor))
+            radius_scale = round(0.80 + (1.20 * pop_factor), 2)
+            exposure_radius_m = int(150 + (250 * pop_factor))
+        elif final_status == "warning":
+            # Inspector verified warning: amber/orange heat (0.40 - 0.70) and moderate plume (90m - 250m)
+            heat_weight = min(0.70, 0.40 + (0.30 * pop_factor))
+            radius_scale = round(0.55 + (0.75 * pop_factor), 2)
+            exposure_radius_m = int(90 + (160 * pop_factor))
         else:
-            heat_weight = max(0.02, min(0.20, risk_prob * 0.25))
-
-        if has_bacteria and heat_weight < 0.7:
-            heat_weight = min(1.0, heat_weight + 0.25)
+            # Inspector verified safe: clean, minimal footprint
+            heat_weight = 0.02
+            radius_scale = 0.35
+            exposure_radius_m = 40
 
         features.append({
             "type": "Feature",
@@ -383,8 +467,14 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
             "properties": {
                 "station_id": loc.get("id"),
                 "name": loc.get("full_name") or loc.get("name") or "Water Station",
-                "barangay": loc.get("barangay"),
-                "status": predicted_status,
+                "barangay": bgy,
+                "barangay_population": bgy_pop,
+                "population_exposure_factor": round(pop_factor, 3),
+                "radius_scale": radius_scale,
+                "exposure_radius_meters": exposure_radius_m,
+                "status": final_status,
+                "inspector_status": raw_status or final_status,
+                "bacteriological_exam": exam or "None",
                 "base_probability": base_prob,
                 "risk_probability": risk_prob,
                 "vulnerability_multiplier": round(hazard_multiplier, 2),
@@ -393,8 +483,8 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
                 "flood_risk_level": in_flood.get("risk_level", "None") if in_flood else "None",
                 "in_landslide_zone": in_landslide is not None,
                 "landslide_risk_level": in_landslide.get("risk_level", "None") if in_landslide else "None",
-                "coliform_count": coliform,
-                "e_coli_count": e_coli,
+                "coliform_count": float(coliform_val or 0) if isinstance(coliform_val, (int, float)) else (1.0 if has_coliform else 0.0),
+                "e_coli_count": float(e_coli_val or 0) if isinstance(e_coli_val, (int, float)) else (1.0 if has_ecoli else 0.0),
                 "weight": round(heat_weight, 4),
             },
         })
@@ -418,6 +508,8 @@ async def recompute_heatmaps(triggered_by: str = "schedule") -> Dict[str, Any]:
 
     _heatmap_cache["is_updating"] = True
     start_time = datetime.now()
+    global _last_run_attempt
+    _last_run_attempt = start_time
     logger.info(f"Starting heatmap computation (triggered by: {triggered_by}) at {start_time.isoformat()}...")
 
     try:
@@ -426,7 +518,9 @@ async def recompute_heatmaps(triggered_by: str = "schedule") -> Dict[str, Any]:
         water_geojson, stats = await generate_water_contamination_heatmap_geojson()
 
         now = datetime.now()
-        next_run = now + timedelta(hours=1)
+        interval_minutes = get_run_interval_minutes()
+        next_run = now + timedelta(minutes=interval_minutes)
+        _heatmap_cache["run_interval_minutes"] = interval_minutes
 
         _heatmap_cache["flood_hazards"] = flood_data
         _heatmap_cache["landslide_hazards"] = landslide_data
@@ -466,18 +560,109 @@ async def get_heatmaps_data() -> Dict[str, Any]:
     return _heatmap_cache
 
 
+async def run_resident_alert_scan(triggered_by: str) -> Dict[str, Any]:
+    """
+    Run citywide ML surveillance and push alerts to residents for CONTAMINATED sources only.
+    Each water source is pushed at most once per day (enforced in forecast_service).
+    """
+    global _last_alert_run
+    from services.forecast_service import run_barangay_surveillance_and_alert
+
+    started = datetime.now()
+    try:
+        res = await run_barangay_surveillance_and_alert(
+            barangay="all",
+            notify_residents=True,
+            current_user_id=None,
+            triggered_by=triggered_by,
+        )
+        entry = {
+            "ran_at": started.isoformat(),
+            "triggered_by": triggered_by,
+            "evaluated": res.get("total_evaluated", 0),
+            "contaminated": res.get("contaminated_count", 0),
+            "warning": res.get("warning_count", 0),
+            "newly_alerted_stations": len(res.get("alerted_station_ids", [])),
+            "suppressed_duplicates": res.get("suppressed_count", 0),
+            "notifications": res.get("notifications_count", 0),
+            "push_sent": res.get("push_stats", {}).get("total_sent", 0),
+            "push_failed": res.get("push_stats", {}).get("total_failed", 0),
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"[{triggered_by}] Resident alert scan failed: {e}", exc_info=True)
+        entry = {"ran_at": started.isoformat(), "triggered_by": triggered_by, "error": str(e)}
+
+    _last_alert_run = entry
+    _append_alert_history(entry)
+    logger.info(f"[{triggered_by}] Resident alert scan: {entry}")
+    return entry
+
+
+def _append_alert_history(entry: Dict[str, Any]) -> None:
+    try:
+        history: List[Dict[str, Any]] = []
+        if os.path.exists(ALERT_HISTORY_PATH):
+            with open(ALERT_HISTORY_PATH, "r", encoding="utf-8") as f:
+                history = json.load(f) or []
+        history.insert(0, entry)
+        with open(ALERT_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history[:20], f, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not write alert history: {e}")
+
+
+async def run_model_cycle(triggered_by: str) -> Dict[str, Any]:
+    """One full engine cycle: recompute heatmaps, then contaminated-only resident alerts."""
+    result = await recompute_heatmaps(triggered_by=triggered_by)
+    await run_resident_alert_scan(triggered_by=triggered_by)
+    return result
+
+
 async def trigger_manual_heatmap_refresh() -> Dict[str, Any]:
-    """Admin manual trigger to bypass the 1-hour wait and refresh immediately."""
-    return await recompute_heatmaps(triggered_by="admin_manual")
+    """Admin manual trigger to bypass the scheduled wait and refresh immediately."""
+    result = await run_model_cycle(triggered_by="admin_manual")
+    # Restart the countdown from this manual run
+    if _reschedule_event is not None:
+        _reschedule_event.set()
+    return result
+
+
+async def _sleep_until_next_run() -> bool:
+    """
+    Sleep until the next scheduled run based on the configured interval.
+    Returns True when it's time to run, False if woken early by an interval change
+    (the caller should then re-evaluate the remaining wait time).
+    """
+    global _reschedule_event
+    if _reschedule_event is None:
+        _reschedule_event = asyncio.Event()
+
+    interval_seconds = get_run_interval_minutes() * 60
+    remaining = interval_seconds
+    if _last_run_attempt is not None:
+        elapsed = (datetime.now() - _last_run_attempt).total_seconds()
+        remaining = max(0.0, interval_seconds - elapsed)
+
+    _reschedule_event.clear()
+    try:
+        await asyncio.wait_for(_reschedule_event.wait(), timeout=remaining)
+        return False  # interval changed -> recompute remaining wait
+    except asyncio.TimeoutError:
+        return True
 
 
 async def hourly_heatmap_worker():
-    """Background loop that recalculates heatmaps every 1 hour (3600 seconds)."""
-    logger.info("Hourly heatmap background scheduler initialized.")
+    """Background loop that recalculates heatmaps on the admin-configured interval."""
+    global _reschedule_event
+    _reschedule_event = asyncio.Event()
+    logger.info(
+        f"Heatmap background scheduler initialized (interval: {get_run_interval_minutes()} min)."
+    )
     # Initial run after server boot
     try:
         await asyncio.sleep(5)  # allow database connections to settle
-        await recompute_heatmaps(triggered_by="startup_scheduler")
+        await run_model_cycle(triggered_by="startup_scheduler")
     except asyncio.CancelledError:
         return
     except Exception as e:
@@ -485,9 +670,13 @@ async def hourly_heatmap_worker():
 
     while True:
         try:
-            await asyncio.sleep(3600)  # 1 hour
-            logger.info("Hourly timer fired: Executing scheduled heatmap recalculation...")
-            await recompute_heatmaps(triggered_by="hourly_cron")
+            should_run = await _sleep_until_next_run()
+            if not should_run:
+                continue
+            logger.info(
+                f"Scheduled timer fired ({get_run_interval_minutes()} min): Running model cycle (heatmaps + resident alerts)..."
+            )
+            await run_model_cycle(triggered_by="scheduled_cron")
         except asyncio.CancelledError:
             logger.info("Hourly heatmap scheduler cancelled.")
             break

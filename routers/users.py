@@ -48,30 +48,41 @@ async def create_user(
 
     sb = get_supabase()
 
-    # Check username uniqueness
-    existing = sb.table("users").select("id").eq("username", body.username).execute()
+    # Check username uniqueness (case-insensitive)
+    existing = sb.table("users").select("id").ilike("username", body.username.strip()).execute()
     if existing.data:
-        raise HTTPException(status_code=400, detail="Username already exists")
+        raise HTTPException(status_code=400, detail="Username already exists. Please choose a different username.")
 
-    # Check email uniqueness
-    if body.email:
-        existing_email = sb.table("users").select("id").eq("email", body.email).execute()
+    # Check email uniqueness (case-insensitive)
+    clean_email = body.email.strip().lower() if body.email and body.email.strip() else None
+    if clean_email:
+        existing_email = sb.table("users").select("id").ilike("email", clean_email).execute()
         if existing_email.data:
-            raise HTTPException(status_code=400, detail="Email already registered")
+            raise HTTPException(status_code=400, detail=f"Email address '{body.email.strip()}' is already registered to another account.")
 
     new_user = {
         "full_name": body.full_name.strip(),
         "username": body.username.strip(),
-        "email": body.email,
+        "email": clean_email,
         "password_hash": hash_password(body.password),
         "role": body.role,
         "barangay": assigned_barangay,
         "is_active": body.is_active,
     }
 
-    result = sb.table("users").insert(new_user).execute()
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Failed to create user")
+    try:
+        result = sb.table("users").insert(new_user).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create user in database")
+    except HTTPException:
+        raise
+    except Exception as e:
+        err_str = str(e).lower()
+        if "email" in err_str and ("duplicate" in err_str or "unique" in err_str):
+            raise HTTPException(status_code=400, detail="Email address is already registered to another account.")
+        if "username" in err_str and ("duplicate" in err_str or "unique" in err_str):
+            raise HTTPException(status_code=400, detail="Username already exists. Please choose a different username.")
+        raise HTTPException(status_code=400, detail=f"Database error: {str(e)}")
 
     user = result.data[0]
     safe_user = {k: v for k, v in user.items() if k != "password_hash"}
@@ -119,7 +130,31 @@ async def update_user(
         else:
             update_data["barangay"] = None
 
-    result = sb.table("users").update(update_data).eq("id", user_id).execute()
+    # Check username uniqueness on update
+    if "username" in update_data and update_data["username"]:
+        clean_user = update_data["username"].strip()
+        existing_user = sb.table("users").select("id").ilike("username", clean_user).neq("id", user_id).execute()
+        if existing_user.data:
+            raise HTTPException(status_code=400, detail="Username already exists. Please choose a different username.")
+        update_data["username"] = clean_user
+
+    # Check email uniqueness on update
+    if "email" in update_data and update_data["email"]:
+        clean_email = update_data["email"].strip().lower()
+        existing_email = sb.table("users").select("id").ilike("email", clean_email).neq("id", user_id).execute()
+        if existing_email.data:
+            raise HTTPException(status_code=400, detail=f"Email address '{update_data['email']}' is already registered to another account.")
+        update_data["email"] = clean_email
+
+    try:
+        result = sb.table("users").update(update_data).eq("id", user_id).execute()
+    except Exception as e:
+        err_str = str(e).lower()
+        if "email" in err_str and ("duplicate" in err_str or "unique" in err_str):
+            raise HTTPException(status_code=400, detail="Email address is already registered to another account.")
+        if "username" in err_str and ("duplicate" in err_str or "unique" in err_str):
+            raise HTTPException(status_code=400, detail="Username already exists. Please choose a different username.")
+        raise HTTPException(status_code=400, detail=f"Database error: {str(e)}")
 
     if not result.data:
         raise HTTPException(status_code=404, detail="User not found")

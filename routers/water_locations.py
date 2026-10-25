@@ -263,6 +263,13 @@ async def create_water_location(
     except Exception as log_exc:
         logger.warning(f"Could not record initial water status log: {log_exc}")
 
+    try:
+        import asyncio
+        from services.heatmap_service import recompute_heatmaps
+        asyncio.create_task(recompute_heatmaps("station_created"))
+    except Exception as recompute_err:
+        logger.debug(f"Could not trigger heatmap recompute: {recompute_err}")
+
     return {"success": True, "message": "Water location created successfully", "data": result.data[0]}
 
 
@@ -448,6 +455,13 @@ async def update_water_location(
             logger.info(f"Dispatched automated Boil Water push notification for station {st_name} in {target_brgy}")
         except Exception as auto_notif_err:
             logger.warning(f"Could not dispatch automatic contamination notification: {auto_notif_err}")
+
+    try:
+        import asyncio
+        from services.heatmap_service import recompute_heatmaps
+        asyncio.create_task(recompute_heatmaps("station_status_updated"))
+    except Exception as recompute_err:
+        logger.debug(f"Could not trigger heatmap recompute: {recompute_err}")
 
     return {"success": True, "message": "Water location updated", "data": updated_station}
 

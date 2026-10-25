@@ -162,19 +162,31 @@ async def create_notification(
 
     created_record = result.data[0]
 
-    # Automatically broadcast Web Push alerts to registered resident devices
-    try:
-        await broadcast_push_notification(
-            title=f"WaterWatch: {new_notif['title']}",
-            message=new_notif.get("message") or "New official water safety advisory has been posted.",
-            barangay=new_notif.get("barangay"),
-            url="/portal/notifications",
-            tag=f"advisory-{created_record.get('id', 'new')}",
-        )
-    except Exception as push_err:
-        logger.warning(f"Error dispatching Web Push alerts: {push_err}")
+    # Strictly restrict Web Push notifications to "critical" (Emergency Outbreak) alerts only.
+    # All other levels (warning, info, safe) are saved to the in-app notice feed only.
+    pushed = False
+    if new_notif.get("type") == "critical":
+        try:
+            await broadcast_push_notification(
+                title=f"🚨 EMERGENCY: {new_notif['title']}",
+                message=new_notif.get("message") or "Emergency water contamination outbreak advisory issued.",
+                barangay=new_notif.get("barangay"),
+                url="/portal/notifications",
+                tag=f"emergency-outbreak-{created_record.get('id', 'new')}",
+            )
+            pushed = True
+            logger.info(f"Dispatched Web Push notifications for Emergency Outbreak: {new_notif['title']}")
+        except Exception as push_err:
+            logger.warning(f"Error dispatching Web Push notifications: {push_err}")
+    else:
+        logger.info(f"Advisory level '{new_notif.get('type')}' saved to in-app notice feed (Web Push skipped - reserved strictly for Emergency Outbreak).")
 
-    return {"success": True, "message": "Notification sent and pushed to residents", "data": created_record}
+    return {
+        "success": True,
+        "message": "Emergency Outbreak broadcasted and pushed to resident devices" if pushed else "Advisory notice posted to in-app feed",
+        "data": created_record,
+        "pushed_to_devices": pushed,
+    }
 
 
 @router.put("/read-all", include_in_schema=False)

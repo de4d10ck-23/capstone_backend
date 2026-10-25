@@ -94,3 +94,111 @@ def validate_and_normalize_barangay(barangay_name: str | None) -> str:
         return MAASIN_BARANGAYS_SET[clean]
     
     raise ValueError(f"'{barangay_name}' is not a valid barangay in Maasin City.")
+
+
+# Official 2020 PSA Census Population by Barangay (City of Maasin, Southern Leyte)
+# Total Population: 87,446
+MAASIN_BARANGAY_POPULATION = {
+    "Abgao": 2510,
+    "Acasia": 343,
+    "Asuncion": 5063,
+    "Bactul I": 552,
+    "Bactul II": 581,
+    "Badiang": 1264,
+    "Bagtican": 675,
+    "Basak": 780,
+    "Bato I": 708,
+    "Bato II": 515,
+    "Batuan": 1098,
+    "Baugo": 559,
+    "Bilibol": 1095,
+    "Bogo": 808,
+    "Cabadiangan": 440,
+    "Cabulihan": 1258,
+    "Cagnituan": 356,
+    "Cambooc": 767,
+    "Cansirong": 963,
+    "Canturing": 1138,
+    "Canyuom": 639,
+    "Combado": 5854,
+    "Dongon": 1472,
+    "Gawisan": 522,
+    "Guadalupe": 1702,
+    "Hanginan": 800,
+    "Hantag": 788,
+    "Hinapu Daku": 942,
+    "Hinapu Gamay": 871,
+    "Ibarra": 4346,
+    "Isagani": 1289,
+    "Laboon": 1604,
+    "Lanao": 547,
+    "Lib-og": 1580,
+    "Libhu": 1785,
+    "Libertad": 432,
+    "Lonoy": 764,
+    "Lunas": 1702,
+    "Mahayahay": 1223,
+    "Malapoc Norte": 927,
+    "Malapoc Sur": 451,
+    "Mambajao": 1948,
+    "Manhilo": 1661,
+    "Mantahan": 4106,
+    "Maria Clara": 2406,
+    "Matin-ao": 644,
+    "Nasaug": 728,
+    "Nati": 335,
+    "Nonok Norte": 515,
+    "Nonok Sur": 678,
+    "Panan-awan": 1304,
+    "Pansaan": 542,
+    "Pasay": 1014,
+    "Pinaskuhan": 552,
+    "Pinascohan": 552,
+    "Rizal": 2061,
+    "San Agustin": 465,
+    "San Isidro": 568,
+    "San Jose": 1102,
+    "San Rafael": 1862,
+    "Santa Cruz": 871,
+    "Santa Rosa": 228,
+    "Santo Niño": 723,
+    "Santo Rosario": 1016,
+    "Sisi": 1189,
+    "Soro-soro": 1189,
+    "Tagnipa": 3266,
+    "Tam-is": 1491,
+    "Tawid": 932,
+    "Tigbawan": 1082,
+    "Tomoy-tomoy": 491,
+    "Tunga-tunga": 1953,
+    "Zaragosa": 350,
+}
+
+MAX_BARANGAY_POPULATION = 5854  # Combado
+DEFAULT_BARANGAY_POPULATION = 1000
+
+
+def get_barangay_population(barangay_name: str | None) -> int:
+    """Return the official 2020 census population for a given Maasin barangay."""
+    if not barangay_name or not str(barangay_name).strip():
+        return DEFAULT_BARANGAY_POPULATION
+    
+    clean = str(barangay_name).strip().lower()
+    for name, pop in MAASIN_BARANGAY_POPULATION.items():
+        if name.lower() == clean:
+            return pop
+
+    import re
+    s = re.sub(r"\(.*?\)", "", clean)
+    s = re.sub(r"\b(barangay|brgy\.?|bgy\.?|poblacion|pob\.?)\b", "", s)
+    s = s.replace(" 1", " i").replace(" 2", " ii").replace("ñ", "n")
+    s = re.sub(r"[^a-z0-9\- ]", " ", s)
+    s = " ".join(s.split())
+
+    for name, pop in MAASIN_BARANGAY_POPULATION.items():
+        n_clean = name.lower().replace("ñ", "n")
+        if n_clean == s or n_clean in s or s in n_clean:
+            return pop
+
+    return DEFAULT_BARANGAY_POPULATION
+

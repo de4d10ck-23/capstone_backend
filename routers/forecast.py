@@ -12,13 +12,19 @@ from services.forecast_service import (
     load_model_payload,
     run_barangay_surveillance_and_alert,
 )
+from pydantic import BaseModel, Field
 from services.heatmap_service import (
     get_heatmaps_data,
     trigger_manual_heatmap_refresh,
+    get_scheduler_status,
+    set_run_interval_minutes,
+    MIN_INTERVAL_MINUTES,
+    MAX_INTERVAL_MINUTES,
 )
 from ml.train_model import run_training_tournament
 
 router = APIRouter(prefix="/api/forecast", tags=["Forecast"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/config")
@@ -151,12 +157,13 @@ async def run_surveillance_endpoint(
     notify_residents: bool = Query(True, description="Whether to send push notification to residents if risk is flagged"),
     threshold_low: Optional[float] = Query(None, description="Optional override for low risk threshold"),
     threshold_high: Optional[float] = Query(None, description="Optional override for high risk threshold"),
+    bypass_daily_limit: bool = Query(False, description="Ignore the 1-push-per-station-per-day limit (testing only)"),
 ):
     """
     On-demand manual trigger to execute machine learning risk surveillance 
     across all water stations in a selected barangay (or all barangays).
-    If any station crosses warning or contamination risk thresholds, 
-    automatically dispatches in-app notifications and Web Push alerts to residents.
+    Only CONTAMINATED stations dispatch in-app notifications and Web Push alerts
+    to residents, max once per water source per day (unless bypass_daily_limit).
     """
     try:
         results = await run_barangay_surveillance_and_alert(
@@ -165,6 +172,8 @@ async def run_surveillance_endpoint(
             custom_threshold_low=threshold_low,
             custom_threshold_high=threshold_high,
             current_user_id=current_user.get("id"),
+            triggered_by="admin_on_demand",
+            bypass_daily_limit=bypass_daily_limit,
         )
         return {"success": True, "data": results}
     except Exception as e:
@@ -209,4 +218,36 @@ async def refresh_heatmaps_endpoint(
     except Exception as e:
         logger.error(f"Manual heatmap refresh error: {e}")
         raise HTTPException(status_code=500, detail=f"Recalculation error: {str(e)}")
+
+
+class ScheduleUpdate(BaseModel):
+    run_interval_minutes: int = Field(..., ge=MIN_INTERVAL_MINUTES, le=MAX_INTERVAL_MINUTES)
+
+
+@router.get("/schedule")
+async def get_schedule_endpoint(
+    current_user: Annotated[dict, Depends(require_admin)],
+):
+    """Get the background model re-run interval (minutes) and next scheduled run."""
+    return {"success": True, "data": get_scheduler_status()}
+
+
+@router.put("/schedule")
+async def update_schedule_endpoint(
+    body: ScheduleUpdate,
+    current_user: Annotated[dict, Depends(require_admin)],
+):
+    """Update how many minutes the background engine waits before re-running the model."""
+    try:
+        set_run_interval_minutes(body.run_interval_minutes)
+        return {
+            "success": True,
+            "message": f"Model will now re-run every {body.run_interval_minutes} minute(s).",
+            "data": get_scheduler_status(),
+        }
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Failed to update schedule interval: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update interval: {str(e)}")
 

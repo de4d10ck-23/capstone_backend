@@ -21,6 +21,51 @@ from ml.dataset import encode_source_type, get_station_hazard_levels, FEATURE_CO
 
 _cached_model_payload: Optional[Dict[str, Any]] = None
 
+# ---------------------------------------------------------------------------
+# Per-station daily push limit (anti-spam)
+# Each contaminated water source may trigger at most ONE resident push per day.
+# ---------------------------------------------------------------------------
+PUSH_ALERT_LOG_PATH = os.path.join(BACKEND_ROOT, "data", "push_alert_log.json")
+
+
+def _today_str() -> str:
+    return datetime.now().date().isoformat()
+
+
+def _load_push_alert_log() -> Dict[str, str]:
+    """Return {station_id: 'YYYY-MM-DD' of last push}, pruned to today's entries."""
+    if not os.path.exists(PUSH_ALERT_LOG_PATH):
+        return {}
+    try:
+        with open(PUSH_ALERT_LOG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        today = _today_str()
+        return {k: v for k, v in data.items() if v == today}
+    except Exception as e:
+        logger.warning(f"Could not read push alert log: {e}")
+        return {}
+
+
+def _save_push_alert_log(log: Dict[str, str]) -> None:
+    try:
+        os.makedirs(os.path.dirname(PUSH_ALERT_LOG_PATH), exist_ok=True)
+        with open(PUSH_ALERT_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=2)
+    except Exception as e:
+        logger.error(f"Could not save push alert log: {e}")
+
+
+def was_station_alerted_today(station_id: str) -> bool:
+    return _load_push_alert_log().get(str(station_id)) == _today_str()
+
+
+def mark_stations_alerted_today(station_ids: List[str]) -> None:
+    log = _load_push_alert_log()
+    today = _today_str()
+    for sid in station_ids:
+        log[str(sid)] = today
+    _save_push_alert_log(log)
+
 
 def load_model_payload(force_reload: bool = False) -> Dict[str, Any]:
     """Load or return cached model pipeline and metadata."""
@@ -256,11 +301,17 @@ async def run_barangay_surveillance_and_alert(
     custom_threshold_low: Optional[float] = None,
     custom_threshold_high: Optional[float] = None,
     current_user_id: Optional[str] = None,
+    triggered_by: str = "admin_manual",
+    bypass_daily_limit: bool = False,
 ) -> Dict[str, Any]:
     """
     Run machine learning risk surveillance across water stations in a selected barangay (or all barangays).
-    If any station crosses warning or contaminated risk thresholds, automatically dispatch
-    in-app advisory notifications and Web Push notifications to subscribed residents.
+
+    Resident alert policy (anti-spam):
+      * Only CONTAMINATED (undrinkable) stations trigger in-app + Web Push alerts.
+        Warning / at-risk stations are reported in the results but residents are NOT notified.
+      * Each water source triggers at most ONE push per calendar day. If the same station is
+        flagged contaminated again on a later run the same day, it is silently suppressed.
     """
     sb = get_supabase()
     query = sb.table("water_locations").select("id, full_name, barangay, latitude, longitude, status")
@@ -302,49 +353,72 @@ async def run_barangay_surveillance_and_alert(
     flagged_total = summary["warning"] + summary["undrinkable"]
     notifications_created = []
     push_summary = {"total_sent": 0, "total_failed": 0}
+    suppressed_stations: List[Dict[str, Any]] = []
+    alerted_station_ids: List[str] = []
 
-    # Dispatch alerts if requested and flagged stations were found
+    # Dispatch alerts ONLY for contaminated stations, max 1 push per station per day
     if notify_residents and flagged_by_barangay:
+        alert_log = _load_push_alert_log()
+        today = _today_str()
+
         for b_name, flagged_list in flagged_by_barangay.items():
+            contaminated_items = [st for st in flagged_list if st.get("predicted_status") == "undrinkable"]
+            if not contaminated_items:
+                continue  # warnings only -> no resident notification
+
+            if bypass_daily_limit:
+                new_items = contaminated_items
+            else:
+                new_items = []
+                for st in contaminated_items:
+                    if alert_log.get(str(st.get("station_id"))) == today:
+                        suppressed_stations.append({
+                            "station_id": st.get("station_id"),
+                            "station_name": st.get("station_name"),
+                            "barangay": b_name,
+                            "reason": "already_notified_today",
+                        })
+                    else:
+                        new_items.append(st)
+
+            if not new_items:
+                logger.info(
+                    f"[{triggered_by}] Brgy. {b_name}: {len(contaminated_items)} contaminated station(s) "
+                    f"already notified today - push suppressed."
+                )
+                continue
+
+            max_risk = max(st.get("risk_percentage", 0) for st in new_items)
+            station_names = [st.get("station_name") or "Water Station" for st in new_items[:3]]
+            names_summary = ", ".join(station_names)
+            if len(new_items) > 3:
+                names_summary += f" and {len(new_items) - 3} other(s)"
+
+            title = f"🚨 Water Quality Alert: Contamination Risk in Brgy. {b_name}"
+            message = (
+                f"Machine learning surveillance detected high contamination probability (peak {max_risk}%) "
+                f"for {len(new_items)} water source(s): {names_summary}. Precautionary water boiling is strongly advised."
+            )
+
+            # 1) In-app notification record (failure here must not block the push)
+            notif_record: Dict[str, Any] = {
+                "title": title,
+                "message": message,
+                "type": "critical",
+                "barangay": b_name,
+                "target_roles": ["resident", "barangay_official"],
+                "created_by": current_user_id,  # NULL for background runs (FK -> users.id)
+            }
             try:
-                contaminated_items = [st for st in flagged_list if st.get("predicted_status") == "undrinkable"]
-                warning_items = [st for st in flagged_list if st.get("predicted_status") == "warning"]
-                max_risk = max([st.get("risk_percentage", 0) for st in flagged_list]) if flagged_list else 0
+                insert_res = sb.table("notifications").insert(notif_record).execute()
+                if insert_res.data:
+                    notif_record = insert_res.data[0]
+            except Exception as notif_err:
+                logger.error(f"[{triggered_by}] Error saving notification for Brgy. {b_name}: {notif_err}")
 
-                is_critical = len(contaminated_items) > 0
-                notif_type = "critical" if is_critical else "warning"
-
-                station_names = [st.get("station_name", "Water Station") for st in flagged_list[:3]]
-                names_summary = ", ".join(station_names)
-                if len(flagged_list) > 3:
-                    names_summary += f" and {len(flagged_list) - 3} other(s)"
-
-                if is_critical:
-                    title = f"🚨 Water Quality Alert: Contamination Risk in Brgy. {b_name}"
-                    message = (
-                        f"Machine learning surveillance detected high contamination probability (peak {max_risk}%) "
-                        f"for {len(flagged_list)} station(s) including {names_summary}. Precautionary water boiling is strongly advised."
-                    )
-                else:
-                    title = f"⚠️ Water Safety Advisory: Elevated Runoff Risk in Brgy. {b_name}"
-                    message = (
-                        f"Machine learning surveillance detected elevated runoff risk (peak {max_risk}%) "
-                        f"for {len(flagged_list)} station(s) including {names_summary}. Please inspect water clarity before drinking."
-                    )
-
-                new_notif = {
-                    "title": title,
-                    "message": message,
-                    "type": notif_type,
-                    "barangay": b_name,
-                    "target_roles": ["resident", "barangay_official"],
-                    "created_by": current_user_id or "00000000-0000-0000-0000-000000000000",
-                }
-                insert_res = sb.table("notifications").insert(new_notif).execute()
-                notif_record = insert_res.data[0] if insert_res.data else new_notif
-                notifications_created.append(notif_record)
-
-                # Send Web Push
+            # 2) Web Push
+            sent_count = 0
+            try:
                 push_res = await broadcast_push_notification(
                     title=f"WaterWatch: {title}",
                     message=message,
@@ -352,14 +426,29 @@ async def run_barangay_surveillance_and_alert(
                     url="/portal/notifications",
                     tag=f"ml-scan-{b_name.lower().replace(' ', '-')}",
                 )
-                sent_count = push_res.get("sent", 0) if isinstance(push_res, dict) else 0
+                if isinstance(push_res, dict):
+                    sent_count = push_res.get("sent", 0)
+                    push_summary["total_failed"] += push_res.get("failed", 0)
                 push_summary["total_sent"] += sent_count
-                push_summary["total_failed"] += push_res.get("failed", 0) if isinstance(push_res, dict) else 0
-                notif_record["pushed_count"] = sent_count
-                notif_record["pushed_residents_count"] = sent_count
-                notif_record["body"] = message
-            except Exception as notif_err:
-                logger.error(f"Error creating notification for barangay {b_name}: {notif_err}")
+            except Exception as push_err:
+                logger.error(f"[{triggered_by}] Web Push error for Brgy. {b_name}: {push_err}")
+
+            notif_record["pushed_count"] = sent_count
+            notif_record["pushed_residents_count"] = sent_count
+            notif_record["body"] = message
+            notifications_created.append(notif_record)
+
+            ids = [str(st.get("station_id")) for st in new_items]
+            alerted_station_ids.extend(ids)
+            for sid in ids:
+                alert_log[sid] = today
+            logger.info(
+                f"[{triggered_by}] Brgy. {b_name}: alerted {len(new_items)} contaminated station(s), "
+                f"{sent_count} push(es) sent."
+            )
+
+        if alerted_station_ids:
+            _save_push_alert_log(alert_log)
 
     return {
         "barangay": target_b or "all",
@@ -375,6 +464,10 @@ async def run_barangay_surveillance_and_alert(
         "notifications_dispatched": notifications_created,
         "notifications": notifications_created,
         "push_stats": push_summary,
+        "triggered_by": triggered_by,
+        "alerted_station_ids": alerted_station_ids,
+        "suppressed_duplicates": suppressed_stations,
+        "suppressed_count": len(suppressed_stations),
         "flagged_stations": [
             {
                 "id": st["station_id"],
