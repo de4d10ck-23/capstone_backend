@@ -54,7 +54,7 @@ async def create_user(
         raise HTTPException(status_code=400, detail="Username already exists. Please choose a different username.")
 
     # Check email uniqueness (case-insensitive)
-    clean_email = body.email.strip().lower() if body.email and body.email.strip() else None
+    clean_email = body.email.lower()
     if clean_email:
         existing_email = sb.table("users").select("id").ilike("email", clean_email).execute()
         if existing_email.data:

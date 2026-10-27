@@ -418,6 +418,7 @@ async def run_barangay_surveillance_and_alert(
 
             # 2) Web Push
             sent_count = 0
+            failed_count = 0
             try:
                 push_res = await broadcast_push_notification(
                     title=f"WaterWatch: {title}",
@@ -428,7 +429,8 @@ async def run_barangay_surveillance_and_alert(
                 )
                 if isinstance(push_res, dict):
                     sent_count = push_res.get("sent", 0)
-                    push_summary["total_failed"] += push_res.get("failed", 0)
+                    failed_count = push_res.get("failed", 0)
+                    push_summary["total_failed"] += failed_count
                 push_summary["total_sent"] += sent_count
             except Exception as push_err:
                 logger.error(f"[{triggered_by}] Web Push error for Brgy. {b_name}: {push_err}")
@@ -439,9 +441,11 @@ async def run_barangay_surveillance_and_alert(
             notifications_created.append(notif_record)
 
             ids = [str(st.get("station_id")) for st in new_items]
-            alerted_station_ids.extend(ids)
-            for sid in ids:
-                alert_log[sid] = today
+            # Keep zero/failed deliveries eligible for the next scheduled attempt.
+            if sent_count > 0 and failed_count == 0:
+                alerted_station_ids.extend(ids)
+                for sid in ids:
+                    alert_log[sid] = today
             logger.info(
                 f"[{triggered_by}] Brgy. {b_name}: alerted {len(new_items)} contaminated station(s), "
                 f"{sent_count} push(es) sent."

@@ -9,6 +9,7 @@ from core.dependencies import get_current_user, get_optional_user, require_staff
 from models.notification import NotificationCreate
 from services.push_service import (
     get_vapid_public_key,
+    get_active_subscriptions,
     save_push_subscription,
     remove_push_subscription,
     broadcast_push_notification,
@@ -41,39 +42,58 @@ async def get_vapid_key():
 
 
 @router.post("/subscribe")
-async def subscribe_device(body: PushSubscriptionRequest):
+async def subscribe_device(body: PushSubscriptionRequest, current_user: Annotated[dict, Depends(get_current_user)]):
     """Save a resident's push subscription token."""
     saved = save_push_subscription(
         subscription=body.subscription,
-        user_id=body.user_id,
-        barangay=body.barangay,
+        user_id=current_user["id"],
+        barangay=current_user.get("barangay"),
     )
     if not saved:
-        raise HTTPException(status_code=400, detail="Invalid push subscription payload")
+        raise HTTPException(status_code=400, detail="Invalid subscription or unable to save device registration")
     return {"success": True, "message": "Device successfully registered for push alerts"}
 
 
 @router.post("/unsubscribe")
-async def unsubscribe_device(body: PushUnsubscribeRequest):
+async def unsubscribe_device(body: PushUnsubscribeRequest, current_user: Annotated[dict, Depends(get_current_user)]):
     """Remove a resident's push subscription token."""
+    if not any(s.get("endpoint") == body.endpoint and s.get("user_id") == current_user["id"] for s in get_active_subscriptions()):
+        raise HTTPException(status_code=404, detail="Device subscription not found")
     remove_push_subscription(body.endpoint)
     return {"success": True, "message": "Device unsubscribed from push alerts"}
 
 
 @router.post("/test-push")
 async def send_test_push(
-    barangay: str | None = None,
-    current_user: Annotated[dict | None, Depends(get_optional_user)] = None,
+    current_user: Annotated[dict, Depends(get_current_user)],
 ):
-    """Send an immediate test push notification to all subscribed devices."""
+    """Send a test only to devices registered to the authenticated user."""
     res = await broadcast_push_notification(
         title="🔔 WaterWatch Alert Test",
         message="Your device is successfully connected to Maasin City real-time water safety alerts!",
-        barangay=barangay,
+        user_id=current_user["id"],
         url="/portal/notifications",
         tag="test-push-notification",
     )
-    return {"success": True, "message": "Test push broadcast dispatched", "details": res}
+    return {"success": res["sent"] > 0, "message": f"Push service accepted {res['sent']} test notification(s); {res['failed']} failed.", "details": res}
+
+
+def _visible_notifications(current_user, barangay=None):
+    """Use the same paginated scope for the list, badge, and mark-all action."""
+    sb = get_supabase()
+    rows = []
+    offset = 0
+    while True:
+        query = sb.table("notifications").select("*").order("created_at", desc=True).order("id")
+        if current_user and current_user.get("role") in ("barangay_official", "resident") and current_user.get("barangay"):
+            query = query.or_(f"barangay.eq.{current_user['barangay']},barangay.is.null")
+        elif barangay:
+            query = query.or_(f"barangay.eq.{barangay},barangay.is.null")
+        page = query.range(offset, offset + 499).execute().data or []
+        rows.extend(page)
+        if len(page) < 500:
+            return rows
+        offset += 500
 
 
 @router.get("", include_in_schema=False)
@@ -83,16 +103,7 @@ async def list_notifications(
     current_user: Annotated[dict | None, Depends(get_optional_user)] = None,
 ):
     """Get notifications for the current user based on their role and barangay, enriched with persistent read status."""
-    sb = get_supabase()
-    query = sb.table("notifications").select("*").order("created_at", desc=True)
-
-    if current_user and current_user.get("role") in ("barangay_official", "resident") and current_user.get("barangay"):
-        query = query.or_(f"barangay.eq.{current_user['barangay']},barangay.is.null")
-    elif barangay:
-        query = query.or_(f"barangay.eq.{barangay},barangay.is.null")
-        
-    result = query.execute()
-    raw_data = result.data or []
+    raw_data = _visible_notifications(current_user, barangay)
 
     # Enrich each notification with persistent is_read status
     user_id = current_user.get("id") if current_user else None
@@ -117,15 +128,7 @@ async def get_unread_count(
     if not current_user:
         return {"success": True, "unread_count": 0}
 
-    sb = get_supabase()
-    query = sb.table("notifications").select("id,created_at,barangay")
-    if current_user.get("role") in ("barangay_official", "resident") and current_user.get("barangay"):
-        query = query.or_(f"barangay.eq.{current_user['barangay']},barangay.is.null")
-    elif barangay:
-        query = query.or_(f"barangay.eq.{barangay},barangay.is.null")
-
-    result = query.execute()
-    enriched = enrich_notifications_with_read_status(result.data or [], current_user.get("id"))
+    enriched = enrich_notifications_with_read_status(_visible_notifications(current_user, barangay), current_user["id"])
     unread_count = sum(1 for n in enriched if not n.get("is_read"))
     return {"success": True, "unread_count": unread_count}
 
@@ -165,16 +168,17 @@ async def create_notification(
     # Strictly restrict Web Push notifications to "critical" (Emergency Outbreak) alerts only.
     # All other levels (warning, info, safe) are saved to the in-app notice feed only.
     pushed = False
+    push_stats = {"total": 0, "sent": 0, "failed": 0}
     if new_notif.get("type") == "critical":
         try:
-            await broadcast_push_notification(
+            push_stats = await broadcast_push_notification(
                 title=f"🚨 EMERGENCY: {new_notif['title']}",
                 message=new_notif.get("message") or "Emergency water contamination outbreak advisory issued.",
                 barangay=new_notif.get("barangay"),
                 url="/portal/notifications",
                 tag=f"emergency-outbreak-{created_record.get('id', 'new')}",
             )
-            pushed = True
+            pushed = push_stats["sent"] > 0
             logger.info(f"Dispatched Web Push notifications for Emergency Outbreak: {new_notif['title']}")
         except Exception as push_err:
             logger.warning(f"Error dispatching Web Push notifications: {push_err}")
@@ -183,9 +187,10 @@ async def create_notification(
 
     return {
         "success": True,
-        "message": "Emergency Outbreak broadcasted and pushed to resident devices" if pushed else "Advisory notice posted to in-app feed",
+        "message": (f"Advisory posted. Push service accepted {push_stats['sent']} notification(s); {push_stats['failed']} failed." if new_notif.get("type") == "critical" else "Advisory notice posted to in-app feed (no device push for this level)."),
         "data": created_record,
         "pushed_to_devices": pushed,
+        "push_stats": push_stats,
     }
 
 
@@ -195,13 +200,7 @@ async def mark_all_read(
     current_user: Annotated[dict, Depends(get_current_user)]
 ):
     """Mark all notifications as read for current user in database (syncs across phone and PC)."""
-    sb = get_supabase()
-    query = sb.table("notifications").select("id,created_at")
-    if current_user.get("role") in ("barangay_official", "resident") and current_user.get("barangay"):
-        query = query.or_(f"barangay.eq.{current_user['barangay']},barangay.is.null")
-    result = query.execute()
-
-    mark_all_notifications_read(current_user["id"], result.data or [])
+    mark_all_notifications_read(current_user["id"], _visible_notifications(current_user))
     return {"success": True, "message": "All notifications marked as read across all devices", "unread_count": 0}
 
 
@@ -212,6 +211,8 @@ async def mark_read(
     current_user: Annotated[dict, Depends(get_current_user)]
 ):
     """Mark a notification as read for current user in database (syncs across phone and PC)."""
+    if not any(str(n["id"]) == notification_id for n in _visible_notifications(current_user)):
+        raise HTTPException(status_code=404, detail="Notification not found")
     mark_notification_read(current_user["id"], notification_id)
     return {"success": True, "message": "Notification marked as read across all devices"}
 

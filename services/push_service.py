@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import logging
 from typing import Dict, Any, List, Optional
@@ -98,8 +99,10 @@ def _save_local_subscriptions():
     try:
         with open(LOCAL_SUBS_FILE, "w", encoding="utf-8") as f:
             json.dump(_local_subscriptions, f, indent=2)
+        return True
     except Exception as e:
         logger.warning(f"Error saving local subscriptions: {e}")
+        return False
 
 
 def _normalize_barangay(b: Optional[str]) -> Optional[str]:
@@ -117,7 +120,7 @@ def save_push_subscription(subscription: Dict[str, Any], user_id: Optional[str] 
     Saves to Supabase if table exists, with fallback to persistent local store.
     """
     endpoint = subscription.get("endpoint")
-    if not endpoint:
+    if not endpoint or not endpoint.startswith("https://") or not all(subscription.get("keys", {}).get(k) for k in ("auth", "p256dh")):
         return False
 
     sub_entry = {
@@ -131,7 +134,8 @@ def save_push_subscription(subscription: Dict[str, Any], user_id: Optional[str] 
     # Save to memory & local store
     _load_local_subscriptions()
     _local_subscriptions[endpoint] = sub_entry
-    _save_local_subscriptions()
+    locally_saved = _save_local_subscriptions()
+    database_saved = False
 
     # Attempt to sync with Supabase
     try:
@@ -143,9 +147,13 @@ def save_push_subscription(subscription: Dict[str, Any], user_id: Optional[str] 
             "barangay": sub_entry["barangay"],
             "updated_at": sub_entry["updated_at"],
         }, on_conflict="endpoint").execute()
+        database_saved = True
     except Exception as e:
         # Table might not exist yet in Supabase, local storage takes over seamlessly
         logger.info(f"Supabase push_subscriptions sync notice (using local storage): {e}")
+
+    if not locally_saved and not database_saved:
+        return False
 
     logger.info(f"Successfully saved push subscription for user {user_id} (barangay: {sub_entry['barangay']})")
     return True
@@ -185,14 +193,20 @@ def get_active_subscriptions(target_barangay: Optional[str] = None) -> List[Dict
                 subs_list.append({
                     "endpoint": item.get("endpoint"),
                     "subscription": item.get("subscription_json"),
+                    "user_id": item.get("user_id"),
+                    "updated_at": item.get("updated_at") or "",
                     "barangay": _normalize_barangay(item.get("barangay")),
                 })
     except Exception as e:
         logger.debug(f"Reading from local subscriptions fallback: {e}")
 
-    # If Supabase returned empty, use local cache
-    if not subs_list:
-        subs_list = list(_local_subscriptions.values())
+    # Merge by endpoint, preserving newer local registrations after a failed sync.
+    merged = {s["endpoint"]: s for s in subs_list if s.get("endpoint")}
+    for endpoint, local in _local_subscriptions.items():
+        remote = merged.get(endpoint)
+        if remote is None or (local.get("updated_at") or "") > remote.get("updated_at", ""):
+            merged[endpoint] = local
+    subs_list = list(merged.values())
 
     # Filter by target barangay if specified
     norm_target = _normalize_barangay(target_barangay)
@@ -212,12 +226,15 @@ async def broadcast_push_notification(
     barangay: Optional[str] = None,
     url: str = "/portal/notifications",
     tag: str = "waterwatch-alert",
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Dispatch Web Push notification to all registered resident devices.
-    Runs concurrently and removes expired subscriptions automatically.
+    Runs network calls off the event loop and removes expired subscriptions.
     """
     subscriptions = get_active_subscriptions(barangay)
+    if user_id is not None:
+        subscriptions = [s for s in subscriptions if s.get("user_id") == user_id]
     if not subscriptions:
         logger.info("No push subscriptions found for broadcast.")
         return {"total": 0, "sent": 0, "failed": 0}
@@ -244,14 +261,18 @@ async def broadcast_push_notification(
         sub_info = sub.get("subscription")
         endpoint = sub.get("endpoint")
         if not sub_info:
+            failed_count += 1
             continue
 
         try:
-            pywebpush.webpush(
+            await asyncio.to_thread(
+                pywebpush.webpush,
                 subscription_info=sub_info,
                 data=payload,
                 vapid_private_key=_vapid_instance or _vapid_keys["private_key"],
-                vapid_claims=vapid_claims,
+                vapid_claims=vapid_claims.copy(),
+                ttl=3600,
+                timeout=15,
             )
             sent_count += 1
         except pywebpush.WebPushException as ex:

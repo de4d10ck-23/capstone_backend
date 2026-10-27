@@ -1,5 +1,5 @@
-from pydantic import BaseModel, EmailStr, Field
-from typing import Optional
+from pydantic import BaseModel, EmailStr, Field, StringConstraints
+from typing import Annotated, Optional
 from datetime import datetime
 
 
@@ -28,10 +28,13 @@ class TokenResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # User CRUD schemas
 # ---------------------------------------------------------------------------
+RequiredEmail = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
 class UserCreate(BaseModel):
     full_name: str = Field(..., min_length=2)
     username: str = Field(..., min_length=3)
-    email: Optional[str] = None
+    email: RequiredEmail
     password: str = Field(..., min_length=6)
     role: str  # admin | city_health_officer | sanitization_inspector | barangay_official | resident
     barangay: Optional[str] = None
@@ -40,7 +43,7 @@ class UserCreate(BaseModel):
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
-    email: Optional[str] = None
+    email: RequiredEmail
     role: Optional[str] = None
     barangay: Optional[str] = None
     is_active: Optional[bool] = None
