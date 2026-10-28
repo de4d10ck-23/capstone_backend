@@ -43,7 +43,7 @@ async def get_current_user(
         )
 
     sb = get_supabase()
-    result = sb.table("users").select("*").eq("id", user_id).single().execute()
+    result = sb.table("users").select("*").eq("id", user_id).limit(1).execute()
 
     if not result.data:
         raise HTTPException(
@@ -51,7 +51,7 @@ async def get_current_user(
             detail="User not found",
         )
 
-    user = result.data
+    user = result.data[0]
     if not user.get("is_active", False):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

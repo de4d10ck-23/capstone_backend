@@ -19,6 +19,7 @@ CREATE TABLE users (
 CREATE TABLE water_locations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     full_name TEXT NOT NULL,
+    source_type TEXT DEFAULT 'unknown',
     barangay TEXT,
     latitude FLOAT NOT NULL,
     longitude FLOAT NOT NULL,

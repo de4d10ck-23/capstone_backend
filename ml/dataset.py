@@ -132,7 +132,7 @@ def encode_source_type(source_type_str: str, name_str: str = "") -> int:
 def fetch_raw_data() -> List[Dict[str, Any]]:
     """Fetch all physical water monitoring stations from Supabase."""
     client = get_supabase()
-    locs_res = client.table("water_locations").select("*").execute()
+    locs_res = client.table("water_locations").select("*").is_("archived_at", "null").execute()
     return locs_res.data or []
 
 

@@ -26,7 +26,7 @@ async def seed_admin():
     
     result = sb.table("users").insert(admin_user).execute()
     if result.data:
-        print(f"Admin account created successfully! Username: {username} Password: {password}")
+        print(f"Admin account created successfully! Username: {username}")
     else:
         print("Failed to create admin account.")
 

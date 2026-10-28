@@ -25,6 +25,14 @@ class TokenResponse(BaseModel):
     user: dict
 
 
+class ResidentProfileUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    full_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=2)]
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]
+    current_password: Optional[str] = None
+    new_password: Optional[str] = Field(None, min_length=6)
+
+
 # ---------------------------------------------------------------------------
 # User CRUD schemas
 # ---------------------------------------------------------------------------
@@ -43,6 +51,8 @@ class UserCreate(BaseModel):
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
+    username: Optional[Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]] = None
+    password: Optional[str] = Field(None, min_length=6)
     email: RequiredEmail
     role: Optional[str] = None
     barangay: Optional[str] = None

@@ -1,9 +1,14 @@
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Dict
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Body, BackgroundTasks
 
 from core.database import get_supabase
 from core.dependencies import get_current_user
+from core.constants import (
+    MAASIN_BARANGAY_POPULATION,
+    get_population_overrides,
+    set_population_overrides,
+)
 
 router = APIRouter(prefix="/api/analytics", tags=["Analytics"])
 
@@ -23,7 +28,7 @@ async def get_overview(
     mode = _normalize_mode(mode)
 
     # Get all water locations
-    locations = sb.table("water_locations").select("*").execute()
+    locations = sb.table("water_locations").select("*").is_("archived_at", "null").execute()
     all_locs = locations.data or []
 
     total = len(all_locs)
@@ -121,7 +126,7 @@ async def get_barangay_stats(
     sb = get_supabase()
     mode = _normalize_mode(mode)
 
-    locations = sb.table("water_locations").select("*").not_.is_("barangay", "null").execute()
+    locations = sb.table("water_locations").select("*").is_("archived_at", "null").not_.is_("barangay", "null").execute()
     all_locs = locations.data or []
 
     # Group by barangay
@@ -175,6 +180,7 @@ async def get_water_quality_trends(
     locations = (
         sb.table("water_locations")
         .select("*")
+        .is_("archived_at", "null")
         .not_.is_("sample_date", "null")
         .order("sample_date")
         .execute()
@@ -221,9 +227,9 @@ async def get_contamination_heatmap(
     mode = _normalize_mode(mode)
 
     if mode == "qualitative":
-        contaminated = sb.table("water_locations").select("*").eq("bacteriological_exam", "failed").execute()
+        contaminated = sb.table("water_locations").select("*").is_("archived_at", "null").eq("bacteriological_exam", "failed").execute()
     else:
-        contaminated = sb.table("water_locations").select("*").eq("e_coli", True).execute()
+        contaminated = sb.table("water_locations").select("*").is_("archived_at", "null").eq("e_coli", True).execute()
 
     sources_data = []
     for source in (contaminated.data or []):
@@ -286,3 +292,48 @@ async def get_household_coverage(
 
     coverage.sort(key=lambda x: x["coverage_percentage"])
     return {"success": True, "data": coverage}
+
+
+@router.get("/populations")
+async def get_populations(
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Return the current merged barangay population map (census defaults + any overrides)."""
+    overrides = get_population_overrides()
+    merged = {**MAASIN_BARANGAY_POPULATION, **overrides}
+    return {"success": True, "data": merged}
+
+
+@router.put("/populations")
+async def update_populations(
+    current_user: Annotated[dict, Depends(get_current_user)],
+    background_tasks: BackgroundTasks,
+    populations: Dict[str, int] = Body(...),
+):
+    """
+    Update barangay population overrides and trigger heatmap recomputation.
+    Only values that differ from the census defaults are stored as overrides.
+    """
+    # Filter: only keep overrides that differ from census defaults
+    overrides = {}
+    for bgy, pop in populations.items():
+        census_val = MAASIN_BARANGAY_POPULATION.get(bgy)
+        if census_val is None or int(pop) != int(census_val):
+            overrides[bgy] = int(pop)
+
+    set_population_overrides(overrides)
+
+    # Trigger heatmap recomputation in the background with updated populations
+    async def _recompute():
+        from services.heatmap_service import recompute_heatmaps
+        await recompute_heatmaps(triggered_by="population_update")
+
+    background_tasks.add_task(_recompute)
+
+    merged = {**MAASIN_BARANGAY_POPULATION, **overrides}
+    return {
+        "success": True,
+        "message": f"Population overrides saved ({len(overrides)} changed). Heatmap recomputing...",
+        "data": merged,
+        "overrides_count": len(overrides),
+    }

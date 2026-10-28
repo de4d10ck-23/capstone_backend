@@ -29,6 +29,8 @@ class WaterLocationCreate(BaseModel):
 class WaterLocationUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    history_date: Optional[str] = None  # Day the snapshot takes effect, in Philippine time
+
     full_name: Optional[str] = None
     name: Optional[str] = None
     barangay: Optional[str] = None

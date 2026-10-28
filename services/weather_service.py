@@ -17,6 +17,56 @@ MAASIN_DEFAULT_LNG = 124.8700
 _LIVE_WEATHER_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
 CACHE_TTL_SECONDS = 600  # 10 minutes cache
 
+_FORECAST_CACHE: Dict[tuple, tuple] = {}
+_FORECAST_ERRORS: Dict[tuple, float] = {}
+
+
+async def get_forecast_weather(target_date: str, lat: float, lng: float) -> Dict[str, Any]:
+    """Daily weather and preceding-day rainfall; never substitute baseline forecasts."""
+    today = datetime.now(timezone(timedelta(hours=8))).date()
+    target = datetime.strptime(target_date, "%Y-%m-%d").date()
+    if not 0 <= (target - today).days <= 7:
+        raise ValueError("Forecast date must be today through seven days ahead (Asia/Manila).")
+    key = (round(lat, 2), round(lng, 2), today.isoformat())
+    if time.time() - _FORECAST_ERRORS.get(key, 0) < 60:
+        raise RuntimeError("Weather provider temporarily unavailable; retry after one minute.")
+    cached = _FORECAST_CACHE.get(key)
+    if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
+        daily = cached[1]
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get("https://api.open-meteo.com/v1/forecast", params={
+                    "latitude": lat, "longitude": lng, "timezone": "Asia/Manila",
+                    "past_days": 1, "forecast_days": 8,
+                    "daily": "precipitation_sum,temperature_2m_mean,relative_humidity_2m_mean",
+                })
+                response.raise_for_status()
+                daily = response.json().get("daily", {})
+        except Exception:
+            _FORECAST_ERRORS[key] = time.time()
+            raise
+        # Expire old entries rather than accumulating a cache per calendar day.
+        for old_key in list(_FORECAST_CACHE):
+            if time.time() - _FORECAST_CACHE[old_key][0] >= CACHE_TTL_SECONDS:
+                del _FORECAST_CACHE[old_key]
+        _FORECAST_CACHE[key] = (time.time(), daily)
+    try:
+        index = daily["time"].index(target_date)
+        if index < 1 or daily["time"][index - 1] != (target - timedelta(days=1)).isoformat():
+            raise ValueError("Missing preceding day")
+        rain = float(daily["precipitation_sum"][index])
+        previous = float(daily["precipitation_sum"][index - 1])
+        return {
+            "date": target_date, "rainfall_24h_mm": rain,
+            "rainfall_48h_mm": rain + previous,
+            "temperature_celsius": float(daily["temperature_2m_mean"][index]),
+            "humidity_percent": float(daily["relative_humidity_2m_mean"][index]),
+            "source": "open-meteo-forecast",
+        }
+    except (KeyError, ValueError, TypeError, IndexError) as exc:
+        raise RuntimeError("Weather forecast is unavailable for the selected date.") from exc
+
 
 async def get_historical_weather(
     target_date: str,

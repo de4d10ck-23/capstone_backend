@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/users", tags=["Users"])
 @router.get("", include_in_schema=False)
 @router.get("/")
 async def list_users(
-    _user: Annotated[dict, Depends(require_staff)],
+    _user: Annotated[dict, Depends(require_admin)],
     role: Optional[str] = Query(None),
 ):
     """List all users. Optionally filter by role. Admin only."""
@@ -96,12 +96,12 @@ async def get_user(
 ):
     """Get user details. Admin only."""
     sb = get_supabase()
-    result = sb.table("users").select("id, full_name, username, email, role, barangay, is_active, created_at, last_login").eq("id", user_id).single().execute()
+    result = sb.table("users").select("id, full_name, username, email, role, barangay, is_active, created_at, last_login").eq("id", user_id).limit(1).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="User not found")
 
-    return {"success": True, "data": result.data}
+    return {"success": True, "data": result.data[0]}
 
 
 @router.put("/{user_id}")
@@ -116,6 +116,12 @@ async def update_user(
     update_data = {k: v for k, v in body.model_dump().items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
+
+    if "password" in update_data:
+        password = update_data.pop("password")
+        if not password.strip():
+            raise HTTPException(status_code=400, detail="Password cannot be blank")
+        update_data["password_hash"] = hash_password(password)
 
     if "role" in update_data and update_data["role"] not in VALID_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {', '.join(VALID_ROLES)}")
@@ -173,12 +179,14 @@ async def toggle_user_active(
     sb = get_supabase()
 
     # Fetch current state
-    current = sb.table("users").select("is_active").eq("id", user_id).single().execute()
+    current = sb.table("users").select("is_active").eq("id", user_id).limit(1).execute()
     if not current.data:
         raise HTTPException(status_code=404, detail="User not found")
 
-    new_active = not current.data["is_active"]
-    sb.table("users").update({"is_active": new_active}).eq("id", user_id).execute()
+    new_active = not current.data[0]["is_active"]
+    result = sb.table("users").update({"is_active": new_active}).eq("id", user_id).eq("is_active", current.data[0]["is_active"]).execute()
+    if not result.data:
+        raise HTTPException(409, "This account changed on another device. Refresh and try again.")
 
     return {"success": True, "message": f"User {'activated' if new_active else 'deactivated'}", "is_active": new_active}
 

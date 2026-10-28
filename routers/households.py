@@ -55,6 +55,7 @@ async def get_risk_analysis(
         contaminated = (
             sb.table("water_locations")
             .select("longitude, latitude, coliform_bacteria, e_coli, full_name, bacteriological_exam")
+            .is_("archived_at", "null")
             .eq("e_coli", True)
             .not_.is_("longitude", "null")
             .not_.is_("latitude", "null")
@@ -64,6 +65,7 @@ async def get_risk_analysis(
         contaminated = (
             sb.table("water_locations")
             .select("longitude, latitude, coliform_bacteria, e_coli, full_name, bacteriological_exam")
+            .is_("archived_at", "null")
             .eq("bacteriological_exam", "failed")
             .not_.is_("longitude", "null")
             .not_.is_("latitude", "null")

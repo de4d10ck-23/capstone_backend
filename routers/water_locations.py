@@ -1,12 +1,12 @@
 import logging
 from typing import Annotated
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 
 from core.database import get_supabase
 from core.dependencies import get_current_user, get_optional_user, require_admin_or_inspector, require_water_location_editor
-from core.storage import upload_to_supabase, delete_from_supabase
+from core.storage import upload_to_supabase
 from models.water_location import WaterLocationCreate, WaterLocationUpdate
 from services.push_service import broadcast_push_notification
 
@@ -17,6 +17,15 @@ router = APIRouter(prefix="/api/water-locations", tags=["Water Locations"])
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
 
 
+def normalize_source_type(value):
+    value = (value or "unknown").strip().lower()
+    if value == "piped_water":
+        value = "piped_tap"
+    if value not in {"unknown", "deep_well", "spring", "piped_tap", "shallow_well", "refilling_station"}:
+        raise HTTPException(422, "Select a valid water source type.")
+    return value
+
+
 @router.get("", include_in_schema=False)
 @router.get("/")
 async def list_water_locations(
@@ -25,10 +34,12 @@ async def list_water_locations(
 ):
     """Get all water locations with optional barangay filtering."""
     sb = get_supabase()
-    query = sb.table("water_locations").select("*")
+    query = sb.table("water_locations").select("*").is_("archived_at", "null")
 
     # Scoped filtering for barangay official or query parameter
-    if current_user and current_user.get("role") == "barangay_official" and current_user.get("barangay"):
+    if current_user and current_user.get("role") == "barangay_official":
+        if not (current_user.get("barangay") or "").strip():
+            raise HTTPException(403, "Your account has no assigned barangay. Contact an administrator.")
         query = query.ilike("barangay", current_user["barangay"].strip())
     elif barangay:
         query = query.ilike("barangay", barangay.strip())
@@ -39,8 +50,8 @@ async def list_water_locations(
         name_val = loc.get("full_name") or loc.get("name") or "Water Station"
         loc["name"] = name_val
         loc["full_name"] = name_val
-        loc["source_type"] = loc.get("source_type") or loc.get("type") or "deep_well"
-        loc["type"] = loc.get("type") or loc.get("source_type") or "deep_well"
+        loc["source_type"] = loc.get("source_type") or loc.get("type") or "unknown"
+        loc["type"] = loc["source_type"]
         if not loc.get("status"):
             loc["status"] = _compute_water_status(loc)
         locations.append(loc)
@@ -55,6 +66,7 @@ async def list_public_water_locations():
     result = (
         sb.table("water_locations")
         .select("id, full_name, barangay, latitude, longitude, coliform_bacteria, e_coli, bacteriological_exam, sample_date, sample_time, image_url, notes")
+        .is_("archived_at", "null")
         .order("created_at", desc=True)
         .execute()
     )
@@ -73,6 +85,27 @@ async def list_public_water_locations():
     return {"success": True, "data": locations}
 
 
+@router.get("/archive")
+async def list_archived_water_locations(
+    current_user: Annotated[dict, Depends(require_water_location_editor)],
+):
+    """Archived stations are visible only to editors in their jurisdiction."""
+    query = get_supabase().table("water_locations").select("*").not_.is_("archived_at", "null")
+    if current_user.get("role") == "barangay_official":
+        barangay = (current_user.get("barangay") or "").strip()
+        if not barangay:
+            raise HTTPException(403, "Your account has no assigned barangay.")
+        query = query.ilike("barangay", barangay)
+    try:
+        rows = query.order("archived_at", desc=True).execute().data or []
+    except Exception as exc:
+        logger.exception("Could not load archived water sources")
+        raise HTTPException(503, "Water source archive is unavailable. Apply the water source archive migration.") from exc
+    for row in rows:
+        row["name"] = row.get("full_name") or "Water Station"
+    return {"success": True, "data": rows}
+
+
 
 @router.get("/{location_id}")
 async def get_water_location(
@@ -81,12 +114,12 @@ async def get_water_location(
 ):
     """Get a specific water location."""
     sb = get_supabase()
-    result = sb.table("water_locations").select("*").eq("id", location_id).single().execute()
+    result = sb.table("water_locations").select("*").eq("id", location_id).is_("archived_at", "null").limit(1).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Water location not found")
 
-    return {"success": True, "data": result.data}
+    return {"success": True, "data": result.data[0]}
  
  
 @router.get("/{location_id}/history")
@@ -94,90 +127,27 @@ async def get_water_location_history(
     location_id: str,
     _user: Annotated[dict, Depends(get_current_user)],
 ):
-    """Fetch status audit timeline logs for a water location."""
+    """Read dated snapshots without mutating the station."""
     sb = get_supabase()
-    logs = []
+    location = sb.table("water_locations").select("id, barangay").eq("id", location_id).is_("archived_at", "null").limit(1).execute()
+    if not location.data:
+        raise HTTPException(404, "Water location not found")
+    if _user.get("role") == "barangay_official":
+        if not (_user.get("barangay") or "").strip() or (_user.get("barangay") or "").strip().lower() != (location.data[0].get("barangay") or "").strip().lower():
+            raise HTTPException(403, "You can only view history in your assigned barangay.")
     try:
-        res = sb.table("water_status_logs").select("*").eq("location_id", location_id).order("recorded_at", desc=False).execute()
-        logs = res.data or []
-    except Exception as exc:
-        logger.warning(f"Error fetching water_status_logs: {exc}")
         logs = []
-
-    # If no logs exist yet, build baseline entry from water_locations
-    if not logs:
-        try:
-            loc = sb.table("water_locations").select("*").eq("id", location_id).single().execute()
-            if loc.data:
-                s_date = loc.data.get("sample_date")
-                s_time = loc.data.get("sample_time") or "12:00:00"
-                formatted_time = s_time if len(s_time) == 8 else f"{s_time}:00" if len(s_time) == 5 else "12:00:00"
-                rec_at = f"{s_date}T{formatted_time}+08:00" if s_date else (loc.data.get("created_at") or loc.data.get("updated_at") or datetime.now(timezone.utc).isoformat())
-                loc_status = (loc.data.get("status") or "safe").lower()
-                loc_exam = loc.data.get("bacteriological_exam")
-                if not loc_exam or loc_status == "unknown":
-                    loc_exam = "untested" if loc_status == "unknown" else ("failed" if loc_status in ("undrinkable", "contaminated") else "passed")
-                logs = [{
-                    "id": f"baseline-{location_id}",
-                    "location_id": location_id,
-                    "status": loc_status,
-                    "previous_status": None,
-                    "bacteriological_exam": loc_exam,
-                    "coliform_count": 1 if loc.data.get("coliform_bacteria") else 0,
-                    "e_coli_count": 1 if loc.data.get("e_coli") else 0,
-                    "notes": "Initial water source registration (Pending safety evaluation)" if loc_status == "unknown" else "Initial water source registration",
-                    "recorded_at": rec_at,
-                    "sample_date": s_date,
-                    "sample_time": s_time,
-                }]
-        except Exception as exc:
-            logger.warning(f"Error generating baseline status log: {exc}")
-
-    # Standardize sample_date and sample_time on each log to avoid local timezone offset shifting
-    for log in logs:
-        rec = log.get("recorded_at") or ""
-        if "T" in rec:
-            log["sample_date"] = rec.split("T")[0]
-            time_part = rec.split("T")[1].replace("Z", "").split("+")[0]
-            log["sample_time"] = time_part[:8] if len(time_part) >= 8 else time_part
-
-    # Identify the chronologically latest audit log
-    def get_sort_key(item):
-        s_d = item.get("sample_date") or ""
-        s_t = item.get("sample_time") or "00:00:00"
-        return f"{s_d}T{s_t}"
-
-    sorted_logs = sorted(logs, key=get_sort_key)
-    latest_log = sorted_logs[-1] if sorted_logs else None
-
-    # Auto-synchronize water_locations if it currently has an outdated status/sample_date
-    if latest_log:
-        try:
-            loc = sb.table("water_locations").select("id, status, sample_date, sample_time").eq("id", location_id).single().execute()
-            if loc.data:
-                curr_date = loc.data.get("sample_date") or ""
-                curr_time = loc.data.get("sample_time") or "00:00:00"
-                curr_key = f"{curr_date}T{curr_time}"
-                latest_key = get_sort_key(latest_log)
-
-                # Sync only if the audit log is strictly newer than the station's sample date
-                if latest_key > curr_key:
-                    sync_payload = {
-                        "status": latest_log.get("status") or loc.data.get("status"),
-                        "sample_date": latest_log.get("sample_date"),
-                        "sample_time": latest_log.get("sample_time"),
-                        "bacteriological_exam": latest_log.get("bacteriological_exam"),
-                        "coliform_bacteria": (latest_log.get("coliform_count") or 0) > 0 if latest_log.get("status") != "unknown" else False,
-                        "e_coli": (latest_log.get("e_coli_count") or 0) > 0 if latest_log.get("status") != "unknown" else False,
-                        "updated_at": datetime.now(timezone.utc).isoformat()
-                    }
-                    if latest_log.get("notes"):
-                        sync_payload["notes"] = latest_log["notes"]
-                    sb.table("water_locations").update(sync_payload).eq("id", location_id).execute()
-        except Exception as sync_err:
-            logger.warning(f"Could not auto-sync water location status: {sync_err}")
-
-    return {"success": True, "data": sorted_logs, "latest": latest_log}
+        while True:
+            page = (sb.table("water_status_logs").select("*").eq("location_id", location_id)
+                .order("effective_date").order("recorded_at").order("id")
+                .range(len(logs), len(logs) + 499).execute().data or [])
+            logs.extend(page)
+            if len(page) < 500:
+                break
+    except Exception:
+        logger.exception("Could not read structured water history")
+        raise HTTPException(503, "Status history is unavailable. Check the water status history migration.")
+    return {"success": True, "data": logs, "latest": logs[-1] if logs else None}
 
 
 @router.post("", include_in_schema=False)
@@ -213,6 +183,7 @@ async def create_water_location(
     notes_val = body.notes or body.description or body.remarks or None
 
     new_loc = {
+        "source_type": normalize_source_type(body.source_type or body.type),
         "full_name": full_name,
         "barangay": body.barangay,
         "latitude": body.latitude,
@@ -221,8 +192,8 @@ async def create_water_location(
         "e_coli": None if status_val == "unknown" else (body.e_coli if body.e_coli is not None else ((body.e_coli_count or 0) > 0)),
         "bacteriological_exam": "untested" if status_val == "unknown" else exam,
         "image_url": body.image_url,
-        "sample_date": body.sample_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "sample_time": body.sample_time or datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "sample_date": body.sample_date or datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d"),
+        "sample_time": body.sample_time or datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"),
         "created_by": current_user["id"],
         "inspector_id": current_user["id"] if current_user["role"] == "sanitization_inspector" else None,
         "status": status_val,
@@ -234,34 +205,7 @@ async def create_water_location(
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to create water location")
 
-    # Record initial status in water_status_logs
-    try:
-        new_id = result.data[0]["id"]
-        s_date = body.sample_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        s_time = body.sample_time or datetime.now(timezone.utc).strftime("%H:%M:%S")
-        formatted_time = s_time if len(s_time) == 8 else f"{s_time}:00" if len(s_time) == 5 else "12:00:00"
-        init_exam = body.bacteriological_exam
-        if not init_exam:
-            if status_val == "safe":
-                init_exam = "passed"
-            elif status_val == "unknown":
-                init_exam = "untested"
-            else:
-                init_exam = "failed"
-
-        sb.table("water_status_logs").insert({
-            "location_id": new_id,
-            "status": status_val,
-            "previous_status": None,
-            "bacteriological_exam": init_exam,
-            "coliform_count": body.coliform_count if body.coliform_count is not None else (1 if body.coliform_bacteria else 0),
-            "e_coli_count": body.e_coli_count if body.e_coli_count is not None else (1 if body.e_coli else 0),
-            "notes": notes_val or ("Initial water source registration (Pending safety evaluation)" if status_val == "unknown" else "Initial water source registration"),
-            "recorded_by": current_user["id"],
-            "recorded_at": f"{s_date}T{formatted_time}+08:00",
-        }).execute()
-    except Exception as log_exc:
-        logger.warning(f"Could not record initial water status log: {log_exc}")
+    # Registration history is saved atomically by the database trigger.
 
     try:
         import asyncio
@@ -286,9 +230,10 @@ async def update_water_location(
     # Fetch existing state for transition audit
     existing = None
     try:
-        existing = sb.table("water_locations").select("*").eq("id", location_id).single().execute()
+        existing = sb.table("water_locations").select("*").eq("id", location_id).is_("archived_at", "null").limit(1).execute()
     except Exception as fetch_err:
         logger.warning(f"Could not fetch existing water location: {fetch_err}")
+        raise HTTPException(503, "Water source lookup is unavailable. Please try again.") from fetch_err
 
     if not existing or not existing.data:
         raise HTTPException(status_code=404, detail="Water location not found")
@@ -296,12 +241,13 @@ async def update_water_location(
     # If barangay official, ensure they can only edit their own barangay
     if current_user.get("role") == "barangay_official":
         user_brgy = (current_user.get("barangay") or "").strip().lower()
-        existing_brgy = (existing.data.get("barangay") or "").strip().lower()
+        existing_brgy = (existing.data[0].get("barangay") or "").strip().lower()
         if not user_brgy or existing_brgy != user_brgy:
             raise HTTPException(status_code=403, detail="You can only edit water stations in your assigned barangay.")
-        body.barangay = existing.data.get("barangay")
+        body.barangay = existing.data[0].get("barangay")
 
-    update_data = {k: v for k, v in body.model_dump().items() if v is not None}
+    update_data = body.model_dump(exclude_unset=True)
+    history_date = update_data.pop("history_date", None) or update_data.get("sample_date") or datetime.now(timezone(timedelta(hours=8))).date().isoformat()
 
     # Validate coordinates if provided
     if "latitude" in update_data and not (10.0 <= update_data["latitude"] <= 10.3):
@@ -320,116 +266,34 @@ async def update_water_location(
     if "name" in update_data and not update_data.get("full_name"):
         update_data["full_name"] = update_data["name"]
 
-    if "description" in update_data and not update_data.get("notes"):
+    if "description" in update_data and "notes" not in update_data:
         update_data["notes"] = update_data["description"]
 
     # Clean non-column fields if present
     update_data.pop("name", None)
     update_data.pop("description", None)
-    update_data.pop("source_type", None)
+    if "source_type" in update_data or "type" in update_data:
+        update_data["source_type"] = normalize_source_type(update_data.get("source_type") or update_data.get("type"))
     update_data.pop("type", None)
     update_data.pop("remarks", None)
     update_data.pop("coliform_count", None)
     update_data.pop("e_coli_count", None)
 
-    # 1. Record status audit in water_status_logs
-    old_status = existing.data.get("status") if existing and existing.data else None
-    new_status = update_data.get("status") or old_status or "safe"
-    s_date = update_data.get("sample_date") or (existing.data.get("sample_date") if existing and existing.data else None) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    s_time = update_data.get("sample_time") or (existing.data.get("sample_time") if existing and existing.data else None) or datetime.now(timezone.utc).strftime("%H:%M:%S")
-
-    formatted_time = s_time if len(s_time) == 8 else f"{s_time}:00" if len(s_time) == 5 else "12:00:00"
-    rec_timestamp = f"{s_date}T{formatted_time}+08:00"
-
-    # Replace any previous log for this exact date on this location so editing a day's status replaces it cleanly
+    old_status = existing.data[0].get("status")
     try:
-        same_date_logs = sb.table("water_status_logs").select("id, recorded_at").eq("location_id", location_id).execute()
-        for old_l in (same_date_logs.data or []):
-            rec = old_l.get("recorded_at") or ""
-            if rec.startswith(s_date) or (f"{s_date}T" in rec):
-                sb.table("water_status_logs").delete().eq("id", old_l["id"]).execute()
-    except Exception as del_err:
-        logger.warning(f"Could not clean previous log for date {s_date}: {del_err}")
-
-    try:
-        log_entry = {
-            "location_id": location_id,
-            "status": new_status,
-            "previous_status": old_status,
-            "bacteriological_exam": "untested" if new_status == "unknown" else (update_data.get("bacteriological_exam") or (existing.data.get("bacteriological_exam") if existing and existing.data else None)),
-            "coliform_count": 0 if new_status == "unknown" else (body.coliform_count if body.coliform_count is not None else (1 if update_data.get("coliform_bacteria") else 0)),
-            "e_coli_count": 0 if new_status == "unknown" else (body.e_coli_count if body.e_coli_count is not None else (1 if update_data.get("e_coli") else 0)),
-            "notes": update_data.get("notes") or f"Status updated to {new_status}",
-            "recorded_by": current_user.get("id"),
-            "recorded_at": rec_timestamp,
-        }
-        sb.table("water_status_logs").insert(log_entry).execute()
-    except Exception as log_exc:
-        logger.warning(f"Could not record water status log: {log_exc}")
-
-    # 2. Determine chronologically latest audit test so water_locations always reflects the latest test
-    try:
-        all_logs_res = sb.table("water_status_logs").select("*").eq("location_id", location_id).order("recorded_at", desc=False).execute()
-        all_logs = all_logs_res.data or []
-
-        def get_log_sort_key(item):
-            rec = item.get("recorded_at") or ""
-            if "T" in rec:
-                date_part = rec.split("T")[0]
-                time_part = rec.split("T")[1].replace("Z", "").split("+")[0][:8]
-                return f"{date_part}T{time_part}"
-            return rec
-
-        if all_logs:
-            sorted_logs = sorted(all_logs, key=get_log_sort_key)
-            latest_log = sorted_logs[-1]
-
-            curr_sub_key = f"{s_date}T{formatted_time}"
-            latest_key = get_log_sort_key(latest_log)
-
-            # If user's submitted test is the latest (or >= latest key), use user's submitted status directly
-            if curr_sub_key >= latest_key:
-                effective_status = new_status
-                effective_date = s_date
-                effective_time = formatted_time
-                effective_exam = "untested" if new_status == "unknown" else update_data.get("bacteriological_exam")
-                effective_notes = update_data.get("notes")
-            else:
-                effective_status = latest_log.get("status") or new_status
-                latest_rec = latest_log.get("recorded_at") or ""
-                effective_date = latest_rec.split("T")[0] if "T" in latest_rec else s_date
-                effective_time = latest_rec.split("T")[1].replace("Z", "").split("+")[0][:8] if "T" in latest_rec else formatted_time
-                effective_exam = latest_log.get("bacteriological_exam")
-                effective_notes = latest_log.get("notes")
-
-            water_loc_sync = {
-                "status": effective_status,
-                "bacteriological_exam": "untested" if effective_status == "unknown" else effective_exam,
-                "sample_date": effective_date,
-                "sample_time": effective_time,
-                "coliform_bacteria": ((latest_log.get("coliform_count") or 0) > 0) if effective_status != "unknown" else None,
-                "e_coli": ((latest_log.get("e_coli_count") or 0) > 0) if effective_status != "unknown" else None,
-            }
-            if effective_notes:
-                water_loc_sync["notes"] = effective_notes
-
-            update_data.update(water_loc_sync)
-    except Exception as latest_exc:
-        logger.warning(f"Could not compute latest status log: {latest_exc}")
-
-    if update_data.get("status") == "unknown":
-        update_data["e_coli"] = None
-        update_data["coliform_bacteria"] = None
-        update_data["bacteriological_exam"] = "untested"
-
-    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-    result = sb.table("water_locations").update(update_data).eq("id", location_id).execute()
-
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Water location not found")
-
-    updated_station = result.data[0]
+        result = sb.rpc("update_water_location_history", {
+            "p_location_id": location_id, "p_patch": update_data,
+            "p_effective_date": history_date, "p_actor": current_user["id"],
+        }).execute()
+    except Exception:
+        logger.exception("Atomic water status history update failed")
+        raise HTTPException(400, "Could not save status history. Check the selected day, sample date, and database history migration.")
+    updated_station = result.data
+    if isinstance(updated_station, list):
+        updated_station = updated_station[0] if updated_station else None
+    if not updated_station:
+        raise HTTPException(500, "Water location update returned no data")
+    new_status = updated_station.get("status")
 
     # Automatically dispatch Boil Water advisory if water source transitioned to contaminated
     if new_status in ("contaminated", "undrinkable") and old_status not in ("contaminated", "undrinkable"):
@@ -438,7 +302,7 @@ async def update_water_location(
             target_brgy = updated_station.get("barangay")
             auto_notif = {
                 "title": f"⚠️ Boil Water Notice: {st_name}",
-                "message": f"Water source '{st_name}' in Brgy. {target_brgy} has been flagged as CONTAMINATED (E. coli detected). Residents are strongly advised to boil water before drinking or use alternative safe stations.",
+                "message": f"Water source '{st_name}' in Brgy. {target_brgy} has been flagged as CONTAMINATED. Residents are strongly advised to boil water before drinking or use alternative safe stations.",
                 "type": "critical",
                 "barangay": target_brgy,
                 "target_roles": ["resident", "barangay_official"],
@@ -473,28 +337,43 @@ async def delete_water_location(
     location_id: str,
     current_user: Annotated[dict, Depends(require_water_location_editor)],
 ):
-    """Delete a water location. Admin, Inspector, or Barangay Official."""
-    sb = get_supabase()
+    """Archive a station without losing its ID or dependent records."""
+    return await set_water_location_archive(location_id, current_user, True)
 
-    # Get location first to check permissions and delete image
-    loc = sb.table("water_locations").select("image_url, barangay").eq("id", location_id).single().execute()
-    if not loc.data:
-        raise HTTPException(status_code=404, detail="Water location not found")
 
-    if current_user.get("role") == "barangay_official":
-        user_brgy = (current_user.get("barangay") or "").strip().lower()
-        existing_brgy = (loc.data.get("barangay") or "").strip().lower()
-        if not user_brgy or existing_brgy != user_brgy:
-            raise HTTPException(status_code=403, detail="You can only delete water stations in your assigned barangay.")
+@router.post("/{location_id}/restore")
+async def restore_water_location(
+    location_id: str,
+    current_user: Annotated[dict, Depends(require_water_location_editor)],
+):
+    return await set_water_location_archive(location_id, current_user, False)
 
-    if loc.data.get("image_url"):
-        await delete_from_supabase(loc.data["image_url"])
 
-    result = sb.table("water_locations").delete().eq("id", location_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Water location not found")
-
-    return {"success": True, "message": "Water location deleted"}
+async def set_water_location_archive(location_id: str, current_user: dict, archive: bool):
+    try:
+        result = get_supabase().rpc("set_water_source_archived", {
+            "p_location_id": location_id,
+            "p_actor_id": current_user["id"],
+            "p_archive": archive,
+        }).execute().data
+    except Exception as exc:
+        message = str(exc)
+        if "Water source not found" in message:
+            raise HTTPException(404, "Water source not found") from exc
+        if "assigned barangay" in message:
+            raise HTTPException(403, "You can only manage water sources in your assigned barangay.") from exc
+        logger.exception("Could not change water source archive state")
+        raise HTTPException(503, "Could not update the water source archive. Apply the archive migration and retry.") from exc
+    station = result[0] if isinstance(result, list) and result else result
+    if not station:
+        raise HTTPException(500, "The archive operation returned no station.")
+    try:
+        import asyncio
+        from services.heatmap_service import recompute_heatmaps
+        asyncio.create_task(recompute_heatmaps("station_archived" if archive else "station_restored"))
+    except Exception as recompute_err:
+        logger.debug("Could not trigger heatmap recompute: %s", recompute_err)
+    return {"success": True, "message": "Water source archived" if archive else "Water source restored", "data": station}
 
 
 @router.post("/upload-image", include_in_schema=False)

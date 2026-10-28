@@ -1,10 +1,12 @@
 from typing import Annotated, Optional
 import logging
+from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 
 from core.database import get_supabase
 from core.dependencies import require_admin, require_staff, get_optional_user
 from models.forecast import ForecastConfig
+from services.saved_forecast_service import get_saved_forecasts, refresh_saved_forecasts
 from services.forecast_service import (
     get_model_status,
     predict_station_risk,
@@ -25,6 +27,23 @@ from ml.train_model import run_training_tournament
 
 router = APIRouter(prefix="/api/forecast", tags=["Forecast"])
 logger = logging.getLogger(__name__)
+
+
+@router.get("/map")
+async def get_map_forecast(
+    forecast_date: date = Query(...),
+    barangay: Optional[str] = Query(None),
+):
+    """Read-only date-specific risk estimates; does not update records or send alerts."""
+    today = datetime.now(timezone(timedelta(hours=8))).date()
+    if not 0 <= (forecast_date - today).days <= 7:
+        raise HTTPException(422, "Choose today through seven days ahead (Asia/Manila).")
+    try:
+        return {"success": True, "data": get_saved_forecasts(forecast_date.isoformat(), barangay)}
+    except Exception:
+        logger.exception("Could not read saved forecasts")
+        raise HTTPException(503, "Saved forecasts are unavailable. Ask an administrator to check the forecast storage setup.")
+
 
 
 @router.get("/config")
@@ -144,6 +163,7 @@ async def run_batch_predictions(
             custom_threshold_low=threshold_low,
             custom_threshold_high=threshold_high,
         )
+        batch_results["forecast_refresh"] = await refresh_saved_forecasts()
         return {"success": True, "data": batch_results}
     except Exception as e:
         logger.error(f"Batch prediction error: {e}")
@@ -166,15 +186,15 @@ async def run_surveillance_endpoint(
     to residents, max once per water source per day (unless bypass_daily_limit).
     """
     try:
+        refresh = await refresh_saved_forecasts()
         results = await run_barangay_surveillance_and_alert(
             barangay=barangay,
             notify_residents=notify_residents,
-            custom_threshold_low=threshold_low,
-            custom_threshold_high=threshold_high,
             current_user_id=current_user.get("id"),
             triggered_by="admin_on_demand",
             bypass_daily_limit=bypass_daily_limit,
         )
+        results["forecast_refresh"] = refresh
         return {"success": True, "data": results}
     except Exception as e:
         logger.error(f"Error in on-demand surveillance: {e}", exc_info=True)

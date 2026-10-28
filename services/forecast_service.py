@@ -5,7 +5,7 @@ import logging
 import joblib
 import numpy as np
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,7 @@ MODEL_PATH = os.path.join(BACKEND_ROOT, "ml", "water_quality_model.pkl")
 METRICS_PATH = os.path.join(BACKEND_ROOT, "ml", "model_evaluation_metrics.json")
 
 from core.database import get_supabase
-from services.weather_service import get_live_weather
+from services.weather_service import get_forecast_weather
 from services.push_service import broadcast_push_notification
 from ml.dataset import encode_source_type, get_station_hazard_levels, FEATURE_COLUMNS
 
@@ -29,7 +29,7 @@ PUSH_ALERT_LOG_PATH = os.path.join(BACKEND_ROOT, "data", "push_alert_log.json")
 
 
 def _today_str() -> str:
-    return datetime.now().date().isoformat()
+    return datetime.now(timezone(timedelta(hours=8))).date().isoformat()
 
 
 def _load_push_alert_log() -> Dict[str, str]:
@@ -139,6 +139,9 @@ async def predict_station_risk(
     station_id: str,
     custom_threshold_low: Optional[float] = None,
     custom_threshold_high: Optional[float] = None,
+    forecast_date: Optional[str] = None,
+    station_data: Optional[dict] = None,
+    config: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """
     Perform real-time machine learning inference for a given water station:
@@ -148,12 +151,16 @@ async def predict_station_risk(
     4. Compute model.predict_proba()
     5. Evaluate against configurable thresholds
     """
-    sb = get_supabase()
-    loc_res = sb.table("water_locations").select("*").eq("id", station_id).execute()
-    if not loc_res.data:
-        raise ValueError(f"Water station with ID {station_id} not found.")
-
-    station = loc_res.data[0]
+    if station_data is None:
+        sb = get_supabase()
+        loc_res = sb.table("water_locations").select("*").eq("id", station_id).is_("archived_at", "null").execute()
+        if not loc_res.data:
+            raise ValueError(f"Water station with ID {station_id} not found.")
+        station_data = loc_res.data[0]
+    station = station_data
+    forecast_date = forecast_date or _today_str()
+    if forecast_date and (station.get("latitude") is None or station.get("longitude") is None):
+        raise ValueError("Station coordinates are required for forecasting.")
     lat = float(station.get("latitude") or 10.1330)
     lng = float(station.get("longitude") or 124.8700)
     source_type = station.get("source_type") or ""
@@ -163,12 +170,12 @@ async def predict_station_risk(
     # Official GIS hazard susceptibility
     flood_level, landslide_level = get_station_hazard_levels(lat, lng)
 
-    # Weather metrics
-    weather_data = await get_live_weather(lat, lng)
-    rf_24h = float(weather_data.get("rainfall_24h_mm") or 0.0)
-    rf_48h = float(weather_data.get("rainfall_48h_mm") or (rf_24h * 1.5))
-    temp = float(weather_data.get("temperature_celsius") or 28.0)
-    humidity = float(weather_data.get("humidity_percent") or 75.0)
+    # All model inputs use daily totals, including today.
+    weather_data = await get_forecast_weather(forecast_date, lat, lng)
+    rf_24h = float(weather_data["rainfall_24h_mm"])
+    rf_48h = float(weather_data["rainfall_48h_mm"])
+    temp = float(weather_data["temperature_celsius"])
+    humidity = float(weather_data["humidity_percent"])
 
     # Encode source protection tier
     source_code = encode_source_type(source_type, station_name)
@@ -194,7 +201,7 @@ async def predict_station_risk(
     risk_score = round(float(proba[1]), 4)
 
     # Load thresholds
-    cfg = get_active_config()
+    cfg = config if config is not None else get_active_config()
     threshold_low = custom_threshold_low if custom_threshold_low is not None else cfg["risk_threshold_low"]
     threshold_high = custom_threshold_high if custom_threshold_high is not None else cfg["risk_threshold_high"]
 
@@ -234,6 +241,7 @@ async def predict_station_risk(
 
     return {
         "station_id": station_id,
+        "forecast_date": forecast_date,
         "station_name": station_name,
         "barangay": barangay,
         "coordinates": {"latitude": lat, "longitude": lng},
@@ -269,7 +277,7 @@ async def predict_all_stations(
 ) -> Dict[str, Any]:
     """Run batch prediction on all water locations."""
     sb = get_supabase()
-    locs_res = sb.table("water_locations").select("id, full_name, barangay").execute()
+    locs_res = sb.table("water_locations").select("id, full_name, barangay").is_("archived_at", "null").execute()
     stations = locs_res.data or []
 
     results = []
@@ -313,42 +321,25 @@ async def run_barangay_surveillance_and_alert(
       * Each water source triggers at most ONE push per calendar day. If the same station is
         flagged contaminated again on a later run the same day, it is silently suppressed.
     """
+    from services.saved_forecast_service import get_saved_forecasts
     sb = get_supabase()
-    query = sb.table("water_locations").select("id, full_name, barangay, latitude, longitude, status")
-
     target_b = (barangay or "").strip()
-    if target_b and target_b.lower() not in ("all", "all barangays", "city-wide", ""):
-        query = query.ilike("barangay", target_b)
-
-    locs_res = query.execute()
-    stations = locs_res.data or []
-
-    results = []
-    summary = {
-        "total": len(stations),
-        "safe": 0,
-        "warning": 0,
-        "undrinkable": 0,
-    }
-    flagged_by_barangay: Dict[str, List[Dict[str, Any]]] = {}
-
-    for s in stations:
-        try:
-            pred = await predict_station_risk(
-                s["id"], custom_threshold_low, custom_threshold_high
-            )
-            results.append(pred)
-            status = pred.get("predicted_status", "safe")
-            if status in summary:
-                summary[status] += 1
-
-            if status in ("warning", "undrinkable"):
-                b_name = pred.get("barangay") or s.get("barangay") or "Maasin City"
-                if b_name not in flagged_by_barangay:
-                    flagged_by_barangay[b_name] = []
-                flagged_by_barangay[b_name].append(pred)
-        except Exception as e:
-            logger.error(f"Error evaluating station {s.get('id')}: {e}")
+    scope = None if target_b.lower() in ("all", "all barangays", "city-wide", "") else target_b
+    saved = get_saved_forecasts(_today_str(), scope)
+    results = saved["results"]
+    if not results and saved["unavailable_station_ids"]:
+        raise RuntimeError("Today's forecasts are unavailable. Run a successful forecast refresh first.")
+    summary = {"total": len(results) + len(saved["unavailable_station_ids"]),
+               "safe": 0, "warning": 0, "undrinkable": 0}
+    flagged_by_barangay = {}
+    for pred in results:
+        status = pred["predicted_status"]
+        if status in summary:
+            summary[status] += 1
+        # Keep old forecasts visible in counts, but never send a new alert from stale data.
+        if status in ("warning", "undrinkable"):
+            b_name = pred.get("barangay") or "Maasin City"
+            flagged_by_barangay.setdefault(b_name, []).append(pred)
 
     flagged_total = summary["warning"] + summary["undrinkable"]
     notifications_created = []
@@ -362,7 +353,7 @@ async def run_barangay_surveillance_and_alert(
         today = _today_str()
 
         for b_name, flagged_list in flagged_by_barangay.items():
-            contaminated_items = [st for st in flagged_list if st.get("predicted_status") == "undrinkable"]
+            contaminated_items = [st for st in flagged_list if st.get("predicted_status") == "undrinkable" and not st.get("stale")]
             if not contaminated_items:
                 continue  # warnings only -> no resident notification
 
@@ -456,6 +447,10 @@ async def run_barangay_surveillance_and_alert(
 
     return {
         "barangay": target_b or "all",
+        "forecast_date": saved["forecast_date"],
+        "stale_count": saved["stale_count"],
+        "unavailable_count": len(saved["unavailable_station_ids"]),
+        "thresholds_used": results[0].get("thresholds_used") if results else None,
         "total_evaluated": len(results),
         "evaluated_stations": len(results),
         "summary": summary,

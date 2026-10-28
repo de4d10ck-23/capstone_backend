@@ -104,6 +104,7 @@ def get_scheduler_status() -> Dict[str, Any]:
         "is_updating": _heatmap_cache.get("is_updating", False),
         "is_running": _scheduler_task is not None and not _scheduler_task.done(),
         "last_alert_run": _last_alert_run,
+        "forecast_refresh": _heatmap_cache.get("forecast_refresh"),
     }
 
 
@@ -250,7 +251,7 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
     """
     sb = get_supabase()
     try:
-        res_loc = sb.table("water_locations").select("*").execute()
+        res_loc = sb.table("water_locations").select("*").is_("archived_at", "null").execute()
         locations = res_loc.data or []
     except Exception as e:
         logger.warning(f"Error loading water locations for heatmap: {e}")
@@ -614,7 +615,9 @@ def _append_alert_history(entry: Dict[str, Any]) -> None:
 
 async def run_model_cycle(triggered_by: str) -> Dict[str, Any]:
     """One full engine cycle: recompute heatmaps, then contaminated-only resident alerts."""
+    from services.saved_forecast_service import refresh_saved_forecasts
     result = await recompute_heatmaps(triggered_by=triggered_by)
+    result["forecast_refresh"] = await refresh_saved_forecasts()
     await run_resident_alert_scan(triggered_by=triggered_by)
     return result
 

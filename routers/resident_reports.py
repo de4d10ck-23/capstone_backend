@@ -44,13 +44,15 @@ async def list_resident_reports(
     sb = get_supabase()
     query = sb.table("resident_reports").select("*").order("created_at", desc=True)
 
-    if current_user["role"] == "barangay_official" and current_user.get("barangay"):
+    if current_user["role"] == "barangay_official":
+        if not (current_user.get("barangay") or "").strip():
+            raise HTTPException(403, "Your account has no assigned barangay. Contact an administrator.")
         query = query.eq("barangay", current_user["barangay"])
     elif current_user["role"] == "resident":
         query = query.eq("submitted_by", current_user["id"])
     elif current_user["role"] in ("sanitization_inspector", "city_health_officer"):
         # Sanitization inspector & CHU ONLY see reports that have been endorsed/escalated by barangay officials
-        query = query.in_("status", ["escalated", "passed_to_chu", "in_progress", "completed", "resolved"])
+        query = query.in_("status", ["escalated", "passed_to_chu", "assigned", "in_progress", "processing", "completed", "resolved", "done", "dismissed"])
 
     result = query.execute()
     data = result.data or []
@@ -59,15 +61,13 @@ async def list_resident_reports(
     for item in data:
         desc = item.get("description") or ""
         if not item.get("image_url") and not item.get("photo_url"):
-            match = re.search(r'\[Attached Photo Proof:\s*(https?://[^\s\]]+)\]', desc, re.IGNORECASE)
-            if not match:
-                match = re.search(r'\[Photo Proof:\s*(https?://[^\s\]]+)\]', desc, re.IGNORECASE)
+            match = re.search(r'\[(?:Attached )?Photo Proof:\s*([^\]]+)\]', desc, re.IGNORECASE)
             if match:
-                item["image_url"] = match.group(1)
-                item["photo_url"] = match.group(1)
+                item["image_url"] = match.group(1).strip()
+                item["photo_url"] = match.group(1).strip()
         
         # Clean description for display
-        item["clean_description"] = re.sub(r'\[(?:Attached )?Photo Proof:\s*https?://[^\s\]]+\]', '', desc, flags=re.IGNORECASE).strip()
+        item["clean_description"] = re.sub(r'\[(?:Attached )?Photo Proof:[^\]]*\]', '', desc, flags=re.IGNORECASE).strip()
 
         # Map rejected status to done or dismissed for Done History
         st = item.get("status")
@@ -87,17 +87,35 @@ async def list_resident_reports(
 @router.post("/")
 async def submit_resident_report(
     body: ResidentReportCreate,
-    current_user: Annotated[dict, Depends(require_roles("resident"))]
+    current_user: Annotated[dict, Depends(require_roles("resident", "barangay_official"))]
 ):
-    """Residents submit a concern or new water source."""
+    """Residents submit reports; officials submit validated concerns for CHU forwarding."""
     sb = get_supabase()
     
     report_type = body.category or body.type or "concern"
+    is_official = current_user.get("role") == "barangay_official"
+    if is_official and report_type == "unregistered_source":
+        raise HTTPException(403, "Use the Water Sources page to register a new source.")
+    location = None
+    if report_type != "unregistered_source":
+        if not body.location_id:
+            raise HTTPException(422, "Select a water source before sending your request.")
+        locations = (sb.table("water_locations").select("id, full_name, barangay, latitude, longitude")
+                     .eq("id", str(body.location_id)).is_("archived_at", "null").execute().data or [])
+        if not locations:
+            raise HTTPException(404, "The selected water source no longer exists. Select another source.")
+        location = locations[0]
+        if not current_user.get("barangay") or (location.get("barangay") or "").strip().lower() != current_user["barangay"].strip().lower():
+            raise HTTPException(403, "Select a water source in your assigned barangay.")
     type_label = report_type.replace("_", " ").title()
     report_title = (body.title or "").strip() or f"{type_label} Report"
     img_url = body.image_url or body.photo_url
     
     desc = body.description.strip()
+    if location:
+        import re
+        desc = re.sub(r"\[Inspected Source:[^\]]*\]", "", desc, flags=re.IGNORECASE).strip()
+        desc += f"\n\n[Inspected Source: {location['full_name']} (ID: {location['id']})]"
     if img_url and "[Attached Photo Proof:" not in desc:
         desc = f"{desc}\n\n[Attached Photo Proof: {img_url}]"
 
@@ -105,11 +123,11 @@ async def submit_resident_report(
         "title": report_title,
         "description": desc,
         "type": report_type,
-        "latitude": body.latitude,
-        "longitude": body.longitude,
-        "barangay": body.barangay or current_user.get("barangay"),
+        "latitude": location["latitude"] if location else body.latitude,
+        "longitude": location["longitude"] if location else body.longitude,
+        "barangay": location["barangay"] if location else (body.barangay or current_user.get("barangay")),
         "submitted_by": current_user["id"],
-        "status": "pending"
+        "status": "validated" if is_official else "pending"
     }
 
     try:
@@ -135,89 +153,67 @@ async def update_resident_report(
 ):
     """Update report status and optionally forward/escalate to Sanitization Inspector."""
     sb = get_supabase()
-    status = body.get("status")
-    reason = body.get("reason")
-    pass_to_inspector = body.get("pass_to_inspector", False)
-    
-    update_data = {
-        "actioned_by": current_user["id"]
-    }
-    if reason is not None:
-        update_data["reason"] = reason
-
-    if status:
-        if status == "done":
-            done_reason = f"[DONE] {reason}" if reason else "[DONE]"
-            update_data["reason"] = done_reason
-            try:
-                test_payload = dict(update_data)
-                test_payload["status"] = "done"
-                result = sb.table("resident_reports").update(test_payload).eq("id", report_id).execute()
-            except Exception:
-                update_data["status"] = "rejected"
-                result = sb.table("resident_reports").update(update_data).eq("id", report_id).execute()
-        elif status == "dismissed":
-            dism_reason = f"[DISMISSED] {reason}" if reason else "[DISMISSED]"
-            update_data["reason"] = dism_reason
-            try:
-                test_payload = dict(update_data)
-                test_payload["status"] = "dismissed"
-                result = sb.table("resident_reports").update(test_payload).eq("id", report_id).execute()
-            except Exception:
-                update_data["status"] = "rejected"
-                result = sb.table("resident_reports").update(update_data).eq("id", report_id).execute()
-        else:
-            update_data["status"] = status
-            result = sb.table("resident_reports").update(update_data).eq("id", report_id).execute()
-    else:
-        result = sb.table("resident_reports").update(update_data).eq("id", report_id).execute()
-
-    if not result.data:
+    existing = sb.table("resident_reports").select("*").eq("id", report_id).execute()
+    if not existing.data:
         raise HTTPException(status_code=404, detail="Report not found")
-    
-    report = result.data[0]
-    st = report.get("status")
-    rs = report.get("reason") or ""
-    if st in ("rejected", "done", "dismissed"):
-        if st == "done" or rs.startswith("[DONE]"):
-            report["status"] = "done"
-            report["reason"] = rs.replace("[DONE]", "").strip()
-        else:
-            report["status"] = "dismissed"
-            report["reason"] = rs.replace("[DISMISSED]", "").strip()
-
-    # If forwarded or escalated to CHU (Sanitization Inspector), auto-create inspection request
-    if pass_to_inspector or status == "escalated":
-        category_label = str(report.get("type") or "Concern").replace("_", " ").title()
-        proof_note = f" (Photo Proof attached)" if report.get("image_url") else ""
-        
-        # Extract location_id if present in description (e.g. ID: <uuid>)
-        loc_id = None
-        desc_text = report.get("description") or ""
-        id_match = re.search(r'\(ID:\s*([a-f0-9\-]+)\)', desc_text)
-        if id_match:
-            loc_id = id_match.group(1)
-
-        inspection_payload = {
-            "location_id": loc_id,
-            "description": f"[{category_label} passed to CHU by Brgy Official] {report.get('title')}: {report.get('description')}{proof_note}",
-            "barangay": report.get("barangay"),
-            "latitude": report.get("latitude") or 10.1330,
-            "longitude": report.get("longitude") or 124.8700,
-            "requested_by": report.get("submitted_by") or current_user["id"],
-            "status": "pending"
-        }
+    current_report = existing.data[0]
+    if current_user["role"] == "barangay_official" and current_report.get("barangay") != current_user.get("barangay"):
+        raise HTTPException(status_code=403, detail="You can only process reports in your barangay.")
+    aliases = {"completed": "done", "resolved": "done", "processing": "in_progress", "passed_to_chu": "escalated"}
+    status = aliases.get(body.get("status"), body.get("status"))
+    if body.get("pass_to_inspector"):
+        status = "escalated"
+    reason = body.get("reason")
+    allowed = {"pending", "validated", "escalated", "in_progress", "done", "dismissed", "rejected"}
+    if status and status not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid report status")
+    old_status = aliases.get(current_report.get("status"), current_report.get("status"))
+    if old_status in ("done", "dismissed", "rejected") and status and status != old_status:
+        raise HTTPException(status_code=409, detail="This report is already closed.")
+    transitions = {
+        "pending": {"pending", "validated", "escalated", "done", "dismissed", "rejected"},
+        "validated": {"validated", "escalated", "done", "dismissed", "rejected"},
+        "escalated": {"escalated", "in_progress", "done", "dismissed"},
+        "assigned": {"escalated", "in_progress", "done", "dismissed"},
+        "in_progress": {"in_progress", "escalated", "done", "dismissed"},
+        "done": {"done"}, "dismissed": {"dismissed"}, "rejected": {"rejected"},
+    }
+    if status and status not in transitions.get(old_status, set()):
+        raise HTTPException(status_code=409, detail="This report cannot move back to an earlier processing stage.")
+    if current_user["role"] in ("sanitization_inspector", "city_health_officer"):
+        if old_status not in ("escalated", "assigned", "in_progress", "done", "dismissed"):
+            raise HTTPException(status_code=403, detail="This report has not been forwarded to CHU.")
+    if status == "in_progress" and current_user["role"] == "barangay_official":
+        raise HTTPException(status_code=403, detail="CHU starts inspection processing.")
+    if status == "escalated":
         try:
-            sb.table("inspection_requests").insert(inspection_payload).execute()
-        except Exception as ex:
-            print("Auto-create inspection failed:", ex)
+            result = sb.rpc("forward_resident_report_to_chu", {
+                "p_report_id": report_id, "p_actor_id": current_user["id"], "p_reason": reason
+            }).execute()
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Could not forward the report to CHU. Check the CHU workflow migration and retry.") from exc
+        report = result.data
+        if isinstance(report, list):
+            report = report[0] if report else None
+        if not report:
+            raise HTTPException(status_code=500, detail="Forwarding returned no report")
+    else:
+        update_data = {"actioned_by": current_user["id"]}
+        if status:
+            update_data["status"] = status
+        if reason is not None:
+            update_data["reason"] = reason
+        result = sb.table("resident_reports").update(update_data).eq("id", report_id).eq("status", current_report["status"]).execute()
+        if not result.data:
+            raise HTTPException(status_code=409, detail="This report changed on another device. Refresh and try again.")
+        report = result.data[0]
 
     # If completed or resolved (e.g. marked done by brgy or registered into official registry by CHU), notify resident
     if status in ("completed", "resolved", "done"):
         try:
-            notif_msg = reason or "Your submitted water report / concern has been marked as Done and resolved by your Barangay Official."
+            notif_msg = reason or "Your report has been processed and marked Done. Review the recorded findings for water safety information."
             sb.table("notifications").insert({
-                "title": f"Water Concern Resolved: {report.get('title') or 'Water Source'}",
+                "title": f"Report Processing Completed: {report.get('title') or 'Water Source'}",
                 "message": f"Brgy. {report.get('barangay')}: {notif_msg}",
                 "type": "report_status",
                 "barangay": report.get("barangay"),
@@ -269,17 +265,7 @@ async def validate_report(
     current_user: Annotated[dict, Depends(require_roles("barangay_official", "sanitization_inspector", "admin"))]
 ):
     """Barangay official validates/approves a resident report."""
-    sb = get_supabase()
-    
-    result = sb.table("resident_reports").update({
-        "status": "validated",
-        "actioned_by": current_user["id"]
-    }).eq("id", report_id).execute()
-    
-    if not result.data:
-         raise HTTPException(status_code=404, detail="Report not found")
-         
-    return {"success": True, "message": "Report validated", "data": result.data[0]}
+    return await update_resident_report(report_id, {"status": "validated"}, current_user)
 
 
 @router.put("/{report_id}/reject")
@@ -289,18 +275,7 @@ async def reject_report(
     current_user: Annotated[dict, Depends(require_roles("barangay_official", "sanitization_inspector", "admin"))]
 ):
     """Barangay official rejects a resident report."""
-    sb = get_supabase()
-    
-    result = sb.table("resident_reports").update({
-        "status": "rejected",
-        "reason": body.reason,
-        "actioned_by": current_user["id"]
-    }).eq("id", report_id).execute()
-    
-    if not result.data:
-         raise HTTPException(status_code=404, detail="Report not found")
-         
-    return {"success": True, "message": "Report rejected", "data": result.data[0]}
+    return await update_resident_report(report_id, {"status": "dismissed", "reason": body.reason}, current_user)
 
 
 @router.put("/{report_id}/escalate")
@@ -310,40 +285,7 @@ async def escalate_report(
     current_user: Annotated[dict, Depends(require_roles("barangay_official", "sanitization_inspector", "admin"))]
 ):
     """Barangay official escalates a concern directly to CHU."""
-    sb = get_supabase()
-    
-    result = sb.table("resident_reports").update({
-        "status": "escalated",
-        "reason": body.reason,
-        "actioned_by": current_user["id"]
-    }).eq("id", report_id).execute()
-    
-    if not result.data:
-         raise HTTPException(status_code=404, detail="Report not found")
-    
-    report = result.data[0]
-    # Extract location_id if present in description (e.g. ID: <uuid>)
-    loc_id = None
-    desc_text = report.get("description") or ""
-    id_match = re.search(r'\(ID:\s*([a-f0-9\-]+)\)', desc_text)
-    if id_match:
-        loc_id = id_match.group(1)
-
-    inspection_payload = {
-        "location_id": loc_id,
-        "description": f"[{category_label} passed to CHU by Brgy Official] {report.get('title')}: {report.get('description')}{proof_note}",
-        "barangay": report.get("barangay"),
-        "latitude": report.get("latitude") or 10.1330,
-        "longitude": report.get("longitude") or 124.8700,
-        "requested_by": report.get("submitted_by") or current_user["id"],
-        "status": "pending"
-    }
-    try:
-        sb.table("inspection_requests").insert(inspection_payload).execute()
-    except Exception as ex:
-        print("Auto-create inspection failed:", ex)
-         
-    return {"success": True, "message": "Report escalated to CHU", "data": report}
+    return await update_resident_report(report_id, {"status": "escalated", "reason": body.reason}, current_user)
 
 
 @router.delete("/{report_id}", include_in_schema=False)
@@ -376,9 +318,9 @@ async def delete_resident_report(
     desc = report.get("description") or ""
     img_url = report.get("image_url") or report.get("photo_url")
     if not img_url:
-        match = re.search(r'\[(?:Attached )?Photo Proof:\s*(https?://[^\s\]]+)\]', desc, re.IGNORECASE)
+        match = re.search(r'\[(?:Attached )?Photo Proof:\s*([^\]]+)\]', desc, re.IGNORECASE)
         if match:
-            img_url = match.group(1)
+            img_url = match.group(1).strip()
     if img_url:
         try:
             await delete_from_supabase(img_url)

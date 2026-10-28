@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-from unittest.mock import Mock, AsyncMock
+from unittest.mock import Mock, AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -113,7 +113,9 @@ class DeliveryTests(unittest.TestCase):
                     get_supabase=lambda: db, predict_station_risk=AsyncMock(return_value=prediction),
                     _load_push_alert_log=lambda: {}, _today_str=lambda: "2026-10-27", _save_push_alert_log=save,
                     broadcast_push_notification=AsyncMock(return_value=dict(sent=sent, failed=failed)))
-                result = asyncio.run(scope["run_barangay_surveillance_and_alert"]())
+                saved = dict(results=[prediction], unavailable_station_ids=[], forecast_date="2026-10-27", stale_count=0)
+                with patch.dict("sys.modules", {"services.saved_forecast_service": SimpleNamespace(get_saved_forecasts=lambda *_: saved)}):
+                    result = asyncio.run(scope["run_barangay_surveillance_and_alert"]())
                 self.assertEqual(bool(result["alerted_station_ids"]), sent > 0 and failed == 0)
                 self.assertEqual(save.called, sent > 0 and failed == 0)
 

@@ -177,13 +177,84 @@ MAASIN_BARANGAY_POPULATION = {
 MAX_BARANGAY_POPULATION = 5854  # Combado
 DEFAULT_BARANGAY_POPULATION = 1000
 
+# Runtime population overrides (in-memory cache, persisted to Supabase)
+_population_overrides: dict[str, int] = {}
+_overrides_loaded: bool = False
+
+import logging as _logging
+_pop_logger = _logging.getLogger("population_overrides")
+
+
+def _load_overrides_from_db() -> dict[str, int]:
+    """Load population overrides from Supabase app_settings table."""
+    global _population_overrides, _overrides_loaded, MAX_BARANGAY_POPULATION
+    try:
+        from core.database import get_supabase
+        sb = get_supabase()
+        res = sb.table("app_settings").select("value").eq("key", "population_overrides").limit(1).execute()
+        if res.data and len(res.data) > 0:
+            import json
+            raw = res.data[0].get("value")
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if isinstance(raw, dict):
+                _population_overrides = {k: int(v) for k, v in raw.items() if v is not None}
+                merged = {**MAASIN_BARANGAY_POPULATION, **_population_overrides}
+                MAX_BARANGAY_POPULATION = max(merged.values()) if merged else 5854
+                _pop_logger.info(f"Loaded {len(_population_overrides)} population overrides from database.")
+    except Exception as e:
+        _pop_logger.warning(f"Could not load population overrides from DB (table may not exist yet): {e}")
+    _overrides_loaded = True
+    return _population_overrides
+
+
+def _save_overrides_to_db(overrides: dict[str, int]) -> None:
+    """Persist population overrides to Supabase app_settings table."""
+    try:
+        from core.database import get_supabase
+        import json
+        sb = get_supabase()
+        sb.table("app_settings").upsert(
+            {"key": "population_overrides", "value": json.dumps(overrides)},
+            on_conflict="key"
+        ).execute()
+        _pop_logger.info(f"Saved {len(overrides)} population overrides to database.")
+    except Exception as e:
+        _pop_logger.error(f"Failed to save population overrides to DB: {e}")
+
+
+def get_population_overrides() -> dict[str, int]:
+    """Return the current population overrides dict (loads from DB on first call)."""
+    global _overrides_loaded
+    if not _overrides_loaded:
+        _load_overrides_from_db()
+    return dict(_population_overrides)
+
+
+def set_population_overrides(overrides: dict[str, int]) -> None:
+    """Replace the population overrides, update MAX, and persist to database."""
+    global _population_overrides, MAX_BARANGAY_POPULATION
+    _population_overrides = {k: int(v) for k, v in overrides.items() if v is not None}
+    # Recalculate max from merged census + overrides
+    merged = {**MAASIN_BARANGAY_POPULATION, **_population_overrides}
+    MAX_BARANGAY_POPULATION = max(merged.values()) if merged else 5854
+    # Persist to database
+    _save_overrides_to_db(_population_overrides)
+
 
 def get_barangay_population(barangay_name: str | None) -> int:
-    """Return the official 2020 census population for a given Maasin barangay."""
+    """Return the population for a given Maasin barangay, checking overrides first."""
     if not barangay_name or not str(barangay_name).strip():
         return DEFAULT_BARANGAY_POPULATION
     
     clean = str(barangay_name).strip().lower()
+
+    # Check overrides first (exact match)
+    for name, pop in _population_overrides.items():
+        if name.lower() == clean:
+            return pop
+
+    # Then check census defaults
     for name, pop in MAASIN_BARANGAY_POPULATION.items():
         if name.lower() == clean:
             return pop
@@ -195,6 +266,13 @@ def get_barangay_population(barangay_name: str | None) -> int:
     s = re.sub(r"[^a-z0-9\- ]", " ", s)
     s = " ".join(s.split())
 
+    # Check overrides with fuzzy match
+    for name, pop in _population_overrides.items():
+        n_clean = name.lower().replace("ñ", "n")
+        if n_clean == s or n_clean in s or s in n_clean:
+            return pop
+
+    # Check census defaults with fuzzy match
     for name, pop in MAASIN_BARANGAY_POPULATION.items():
         n_clean = name.lower().replace("ñ", "n")
         if n_clean == s or n_clean in s or s in n_clean:

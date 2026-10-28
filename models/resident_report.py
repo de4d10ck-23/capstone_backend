@@ -1,8 +1,10 @@
 from pydantic import BaseModel, Field
 from typing import Optional
+from uuid import UUID
 
 
 class ResidentReportCreate(BaseModel):
+    location_id: Optional[UUID] = None
     title: Optional[str] = "Community Concern"
     description: str = Field(..., min_length=1)
     type: Optional[str] = "concern"
