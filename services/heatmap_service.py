@@ -3,7 +3,7 @@ import json
 import math
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
 import shapely.geometry
@@ -508,7 +508,7 @@ async def recompute_heatmaps(triggered_by: str = "schedule") -> Dict[str, Any]:
         return _heatmap_cache
 
     _heatmap_cache["is_updating"] = True
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     global _last_run_attempt
     _last_run_attempt = start_time
     logger.info(f"Starting heatmap computation (triggered by: {triggered_by}) at {start_time.isoformat()}...")
@@ -518,7 +518,7 @@ async def recompute_heatmaps(triggered_by: str = "schedule") -> Dict[str, Any]:
         hazard_geojson = await generate_hazard_heatmap_geojson()
         water_geojson, stats = await generate_water_contamination_heatmap_geojson()
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         interval_minutes = get_run_interval_minutes()
         next_run = now + timedelta(minutes=interval_minutes)
         _heatmap_cache["run_interval_minutes"] = interval_minutes
@@ -540,7 +540,7 @@ async def recompute_heatmaps(triggered_by: str = "schedule") -> Dict[str, Any]:
             "triggered_by": triggered_by,
         }
         logger.info(
-            f"Heatmap computation completed in {(datetime.now() - start_time).total_seconds():.2f}s: "
+            f"Heatmap computation completed in {(datetime.now(timezone.utc) - start_time).total_seconds():.2f}s: "
             f"{_heatmap_cache['summary']['flood_zones']} flood zones, "
             f"{_heatmap_cache['summary']['landslide_zones']} landslide zones, "
             f"{_heatmap_cache['summary']['total_water_stations']} water stations evaluated."
@@ -569,7 +569,7 @@ async def run_resident_alert_scan(triggered_by: str) -> Dict[str, Any]:
     global _last_alert_run
     from services.forecast_service import run_barangay_surveillance_and_alert
 
-    started = datetime.now()
+    started = datetime.now(timezone.utc)
     try:
         res = await run_barangay_surveillance_and_alert(
             barangay="all",
@@ -644,7 +644,7 @@ async def _sleep_until_next_run() -> bool:
     interval_seconds = get_run_interval_minutes() * 60
     remaining = interval_seconds
     if _last_run_attempt is not None:
-        elapsed = (datetime.now() - _last_run_attempt).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - _last_run_attempt).total_seconds()
         remaining = max(0.0, interval_seconds - elapsed)
 
     _reschedule_event.clear()

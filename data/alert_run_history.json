@@ -1,5 +1,18 @@
 [
   {
+    "ran_at": "2026-10-29T06:45:10.051807",
+    "triggered_by": "startup_scheduler",
+    "evaluated": 121,
+    "contaminated": 3,
+    "warning": 79,
+    "newly_alerted_stations": 1,
+    "suppressed_duplicates": 0,
+    "notifications": 2,
+    "push_sent": 1,
+    "push_failed": 0,
+    "error": null
+  },
+  {
     "ran_at": "2026-10-28T21:08:22.177424",
     "triggered_by": "startup_scheduler",
     "evaluated": 121,
@@ -219,19 +232,6 @@
   },
   {
     "ran_at": "2026-10-28T16:05:16.182522",
-    "triggered_by": "startup_scheduler",
-    "evaluated": 122,
-    "contaminated": 3,
-    "warning": 80,
-    "newly_alerted_stations": 0,
-    "suppressed_duplicates": 1,
-    "notifications": 1,
-    "push_sent": 0,
-    "push_failed": 0,
-    "error": null
-  },
-  {
-    "ran_at": "2026-10-28T15:47:20.411288",
     "triggered_by": "startup_scheduler",
     "evaluated": 122,
     "contaminated": 3,

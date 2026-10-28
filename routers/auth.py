@@ -1,13 +1,15 @@
 from typing import Annotated
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, Request
 
 from core.database import get_supabase
 from core.security import hash_password, verify_password, create_access_token
 from core.dependencies import get_current_user
 from core.constants import validate_and_normalize_barangay
-from models.user import LoginRequest, RegisterRequest, TokenResponse, ResidentProfileUpdate
+from models.user import LoginRequest, RegisterRequest, TokenResponse, ResidentProfileUpdate, EmailRequest, EmailTokenRequest, ResetPasswordRequest
+
+from services.email_auth_service import issue_email_link, complete_email_action
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
@@ -32,11 +34,14 @@ async def login(body: LoginRequest):
     if not user.get("is_active", False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated. Contact the administrator.")
 
+    if not user.get("email_verified", True):
+        raise HTTPException(403, "Please verify your email before signing in.")
+
     # Update last_login
     sb.table("users").update({"last_login": datetime.now(timezone.utc).isoformat()}).eq("id", user["id"]).execute()
 
     # Build token
-    token = create_access_token({"sub": user["id"], "username": user["username"], "role": user["role"]})
+    token = create_access_token({"sub": user["id"], "username": user["username"], "role": user["role"], "auth_version": user.get("auth_version", 0)})
 
     # Strip password_hash from response
     safe_user = {k: v for k, v in user.items() if k != "password_hash"}
@@ -45,18 +50,22 @@ async def login(body: LoginRequest):
 
 
 @router.post("/register")
-async def register(body: RegisterRequest):
+async def register(body: RegisterRequest, request: Request):
     """Self-registration for residents only."""
     sb = get_supabase()
 
+    body.email = str(body.email).strip().lower()
+    body.username = body.username.strip()
+    if not body.password.strip() or len(body.password.encode("utf-8")) > 72:
+        raise HTTPException(400, "Password must be nonblank and at most 72 UTF-8 bytes.")
     # Check username uniqueness
     existing = sb.table("users").select("id").eq("username", body.username).execute()
     if existing.data:
         raise HTTPException(status_code=400, detail="Username already exists")
 
-    # Check email uniqueness (if provided)
+    # Required email is normalized before storing or sending.
     if body.email:
-        existing_email = sb.table("users").select("id").eq("email", body.email).execute()
+        existing_email = sb.table("users").select("id").ilike("email", body.email.replace("%", "\\%").replace("_", "\\_")).execute()
         if existing_email.data:
             raise HTTPException(status_code=400, detail="Email already registered")
 
@@ -66,7 +75,7 @@ async def register(body: RegisterRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Create user as resident
+    # Store only a pending registration; confirmation creates the resident row.
     new_user = {
         "full_name": body.full_name.strip(),
         "username": body.username.strip(),
@@ -77,15 +86,34 @@ async def register(body: RegisterRequest):
         "is_active": True,
     }
 
-    result = sb.table("users").insert(new_user).execute()
+    await issue_email_link(body.email, "register", new_user, request.client.host if request.client else "unknown")
+    return {"success": True, "message": "Check your email to confirm your account. The link expires in 15 minutes."}
 
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Failed to create account")
 
-    user = result.data[0]
-    safe_user = {k: v for k, v in user.items() if k != "password_hash"}
+@router.post("/verify-email")
+async def verify_email(body: EmailTokenRequest):
+    complete_email_action(body.token, "register")
+    return {"success": True, "message": "Email verified. Your account is ready. You can now sign in."}
 
-    return {"success": True, "message": "Account created successfully", "user": safe_user}
+
+@router.post("/forgot-password")
+async def forgot_password(body: EmailRequest, request: Request):
+    email = str(body.email).strip().lower()
+    pattern = email.replace("%", "\\%").replace("_", "\\_")
+    users = get_supabase().table("users").select("id,role,is_active,email_verified,auth_version").ilike("email", pattern).execute().data or []
+    user = users[0] if len(users) == 1 else None
+    eligible = bool(user and user["role"] == "resident" and user["is_active"] and user.get("email_verified", True))
+    payload = {"user_id": user["id"], "auth_version": user.get("auth_version", 0)} if eligible else {}
+    await issue_email_link(email, "reset", payload, request.client.host if request.client else "unknown", deliver=eligible)
+    return {"success": True, "message": "If an active resident account uses that email, a reset link will arrive shortly. Check spam too. You may request another link after one minute."}
+
+
+@router.post("/reset-password")
+async def reset_password(body: ResetPasswordRequest):
+    if not body.password.strip() or len(body.password.encode("utf-8")) > 72:
+        raise HTTPException(400, "Password must be nonblank and at most 72 UTF-8 bytes.")
+    complete_email_action(body.token, "reset", hash_password(body.password))
+    return {"success": True, "message": "Password reset. Please sign in with your new password."}
 
 
 @router.get("/me")

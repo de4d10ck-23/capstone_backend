@@ -2,6 +2,10 @@
 
 Apply the SQL files in the connected Supabase project's SQL Editor before deploying the corresponding code.
 
+## Resident email authentication (20261029_resident_email_auth.sql)
+
+Apply before deploying the resident email-verification/password-reset backend. Adds private pending email tokens, atomic confirmation/reset functions, cross-worker request limits, verified-account metadata, and a session version for reset revocation. Existing accounts remain verified; admin-created accounts bypass confirmation. Public registration creates an account only after confirmation. See [RESIDENT_EMAIL_SETUP.md](../RESIDENT_EMAIL_SETUP.md) for Resend sender verification, backend secrets, and deployment steps.
+
 ## Recoverable water source archive (20261028_water_source_archive.sql)
 
 Apply after `20261028_water_status_history.sql`, then deploy the backend, staff, and admin frontends together. The Water Sources Registry has an Archived Stations view with Restore. Archiving keeps the station row and original ID, photos, dated status logs, linked concerns/inspections, and saved forecasts. A restored source returns with its prior status and history. Archive and restore actions record the actor and time; repeated requests do not create extra events. Archived sources are excluded from active maps, analytics, forecast runs, concern selection, and the current station registry. Historical report periods ending before the archive day can still include the source.

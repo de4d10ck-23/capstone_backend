@@ -52,6 +52,10 @@ async def get_current_user(
         )
 
     user = result.data[0]
+    if payload.get("auth_version", 0) != user.get("auth_version", 0):
+        raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
+    if not user.get("email_verified", True):
+        raise HTTPException(status_code=403, detail="Please verify your email.")
     if not user.get("is_active", False):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -76,7 +80,9 @@ async def get_optional_user(
     try:
         sb = get_supabase()
         result = sb.table("users").select("*").eq("id", user_id).single().execute()
-        return result.data if result.data and result.data.get("is_active") else None
+        user = result.data
+        return user if (user and user.get("is_active") and user.get("email_verified", True)
+                        and payload.get("auth_version", 0) == user.get("auth_version", 0)) else None
     except Exception:
         return None
 

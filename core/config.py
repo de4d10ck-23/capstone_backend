@@ -27,6 +27,9 @@ class Settings:
     JWT_ALGORITHM: str = "HS256"
     SUPABASE_STORAGE_BUCKET: str = os.getenv("SUPABASE_STORAGE_BUCKET", "waterwatch-images")
     OPENWEATHER_API_KEY: str = os.getenv("OPENWEATHER_API_KEY", "")
+    RESEND_API_KEY: str = os.getenv("RESEND_API_KEY", "")
+    RESEND_FROM_EMAIL: str = os.getenv("RESEND_FROM_EMAIL", "")
+    RESIDENT_PORTAL_URL: str = os.getenv("RESIDENT_PORTAL_URL", "http://localhost:5982")
 
 
 settings = Settings()

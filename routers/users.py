@@ -68,6 +68,7 @@ async def create_user(
         "role": body.role,
         "barangay": assigned_barangay,
         "is_active": body.is_active,
+        "email_verified": True,
     }
 
     try:

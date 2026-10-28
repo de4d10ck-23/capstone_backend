@@ -12,10 +12,11 @@ class LoginRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
-    full_name: str = Field(..., min_length=2)
-    username: str = Field(..., min_length=3)
-    email: Optional[str] = None
-    password: str = Field(..., min_length=6)
+    model_config = {"extra": "forbid"}
+    full_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=2)]
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]
+    email: EmailStr
+    password: str = Field(..., min_length=6, max_length=72)
     barangay: Optional[str] = None
 
 
@@ -23,6 +24,18 @@ class TokenResponse(BaseModel):
     success: bool = True
     token: str
     user: dict
+
+
+class EmailRequest(BaseModel):
+    email: EmailStr
+
+
+class EmailTokenRequest(BaseModel):
+    token: str = Field(..., min_length=32, max_length=128)
+
+
+class ResetPasswordRequest(EmailTokenRequest):
+    password: str = Field(..., min_length=6, max_length=72)
 
 
 class ResidentProfileUpdate(BaseModel):
