@@ -199,7 +199,14 @@ async def delete_user(
 ):
     """Delete a user. Admin only."""
     sb = get_supabase()
-    result = sb.table("users").delete().eq("id", user_id).execute()
+    current = sb.table("users").select("username").eq("id", user_id).limit(1).execute()
+    if not current.data:
+        raise HTTPException(status_code=404, detail="User not found")
+    username = current.data[0]["username"]
+    if username.strip().casefold() == "admin":
+        raise HTTPException(status_code=403, detail="The admin account cannot be deleted.")
+    # Require the same username so a concurrent rename cannot bypass protection.
+    result = sb.table("users").delete().eq("id", user_id).eq("username", username).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="User not found")
