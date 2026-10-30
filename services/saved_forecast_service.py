@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from core.database import get_supabase
 from services.forecast_service import get_active_config, load_model_payload, predict_station_risk
+from services.hazard_risk_service import fetch_hazard_records, HAZARD_MODEL_VERSION
 
 logger = logging.getLogger(__name__)
 _refresh_lock = asyncio.Lock()
@@ -33,6 +34,7 @@ async def refresh_saved_forecasts():
                 raise RuntimeError("Prediction model is unavailable")
             stations = read_all(sb.table("water_locations").select("*").is_("archived_at", "null").order("id"))
             config = get_active_config()
+            hazards = fetch_hazard_records()
             today = started.astimezone(MANILA).date()
             # Group stations by weather grid so one provider request supplies all eight dates.
             groups = {}
@@ -52,7 +54,7 @@ async def refresh_saved_forecasts():
                         for station in group:
                             try:
                                 prediction = await predict_station_risk(station["id"],
-                                    forecast_date=target, station_data=station, config=config)
+                                    forecast_date=target, station_data=station, config=config, hazard_records=hazards)
                                 rows.append({"station_id": station["id"], "forecast_date": target,
                                     "prediction": prediction, "generated_at": started.isoformat()})
                             except Exception as exc:
@@ -94,7 +96,7 @@ def get_saved_forecasts(forecast_date, barangay=None):
             continue
         generated = datetime.fromisoformat(row["generated_at"].replace("Z", "+00:00"))
         results.append({**row["prediction"], "generated_at": row["generated_at"],
-                        "stale": now - generated > max_age})
+                        "stale": now - generated > max_age or row['prediction'].get('hazard_model_version') != HAZARD_MODEL_VERSION})
     available = {str(result["station_id"]) for result in results}
     return {"forecast_date": forecast_date, "results": results,
         "unavailable_station_ids": sorted(ids - available), "timezone": "Asia/Manila",

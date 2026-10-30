@@ -20,8 +20,8 @@ router = APIRouter(prefix="/api/hazards", tags=["Contamination Hazards"])
 @router.get("/environmental-layers")
 async def get_environmental_hazard_layers():
     """
-    Return the official Maasin Flood and Landslide Hazard Susceptibility layers
-    derived from official DENR-MGB / Study Area GIS datasets in Maasin_LandFlood.
+    Return study-map flood vectors and approximate image-derived landslide zones.
+    Estimated continuations retain their provenance properties.
     """
     from services.heatmap_service import load_official_hazard_datasets
     flood_data, landslide_data = load_official_hazard_datasets()
@@ -81,8 +81,8 @@ async def list_hazards(
         rows = res.data or []
     except Exception as exc:
         logger.warning(f"Error reading contamination_hazards table: {exc}")
-        # Return empty list gracefully if table is not yet migrated in Supabase
-        rows = []
+        # An unavailable inventory is not evidence that no hazards are mapped.
+        raise HTTPException(status_code=503, detail="Mapped hazard inventory is unavailable") from exc
 
     # Format as GeoJSON FeatureCollection
     features = []
@@ -168,13 +168,15 @@ async def update_hazard(
     body: HazardUpdate,
     current_user: Annotated[dict, Depends(require_staff)],
 ):
-    """Update hazard metadata (name, type, risk level, notes)."""
+    """Update hazard metadata, including its designated barangay."""
     sb = get_supabase()
     updates = {}
     if body.name is not None:
         updates["name"] = body.name.strip()
     if body.hazard_type is not None:
         updates["hazard_type"] = body.hazard_type.strip()
+    if body.barangay is not None:
+        updates["barangay"] = body.barangay
     if body.risk_level is not None:
         updates["risk_level"] = body.risk_level.strip()
     if body.notes is not None:

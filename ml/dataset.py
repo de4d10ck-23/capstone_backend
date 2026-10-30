@@ -19,11 +19,12 @@ from core.database import get_supabase
 
 # ============================================================================
 # RECOMMENDED FEATURE PARAMETERS FOR WATER CONTAMINATION FORECASTING
-# Aligned with official DENR-MGB GIS hazard layers from Maasin_LandFlood,
-# live meteorological indicators, and WHO/PNSDW sanitary protection levels.
+# Training compatibility schema. Spatial lookup now uses the new study map.
+# Production uses a neutral-hazard RF baseline plus explicit hazard adjustments;
+# historical RF validation metrics do not validate that combined risk index.
 # ============================================================================
 FEATURE_COLUMNS = [
-    "flood_susceptibility_level",      # 0: None/Low, 1: Moderate (MF), 2: High (HF)
+    "flood_susceptibility_level",      # Legacy slot: new F encodes presence as 1, not moderate severity
     "landslide_susceptibility_level",  # 0: None/Low, 1: Moderate (ML), 2: High (HL)
     "rainfall_intensity_mm",           # 24-hour cumulative rainfall (mm)
     "cumulative_48h_rainfall_mm",      # 48-hour cumulative rainfall (mm)
@@ -55,69 +56,18 @@ _cached_hazard_shapes = None
 
 
 def load_hazard_shapes():
-    """Load and parse official flood and landslide geometries from GeoJSON."""
-    global _cached_hazard_shapes
-    if _cached_hazard_shapes is not None:
-        return _cached_hazard_shapes
-
-    flood_path = os.path.join(DATA_DIR, "maasin_flood_hazards.json")
-    landslide_path = os.path.join(DATA_DIR, "maasin_landslide_hazards.json")
-
-    flood_shapes = []
-    if os.path.exists(flood_path):
-        try:
-            with open(flood_path, "r", encoding="utf-8") as f:
-                fc = json.load(f)
-                for feat in fc.get("features", []):
-                    if feat.get("geometry"):
-                        flood_shapes.append((shape(feat["geometry"]), feat.get("properties", {})))
-        except Exception as e:
-            print(f"Error reading {flood_path}: {e}")
-
-    landslide_shapes = []
-    if os.path.exists(landslide_path):
-        try:
-            with open(landslide_path, "r", encoding="utf-8") as f:
-                fc = json.load(f)
-                for feat in fc.get("features", []):
-                    if feat.get("geometry"):
-                        landslide_shapes.append((shape(feat["geometry"]), feat.get("properties", {})))
-        except Exception as e:
-            print(f"Error reading {landslide_path}: {e}")
-
-    _cached_hazard_shapes = (flood_shapes, landslide_shapes)
-    return _cached_hazard_shapes
+    """Compatibility accessor backed exclusively by the new study map."""
+    from services.hazard_risk_service import load_study_data
+    features = load_study_data()['features']
+    return tuple([(shape(f['geometry']), f['properties']) for f in features
+                  if f['properties']['kind'] == kind] for kind in ('flood', 'landslide'))
 
 
 def get_station_hazard_levels(lat: float, lng: float) -> Tuple[int, int]:
-    """
-    Returns (flood_susceptibility_level, landslide_susceptibility_level)
-    Levels: 0 = Low/None, 1 = Moderate, 2 = High
-    """
-    flood_shapes, landslide_shapes = load_hazard_shapes()
-    pt = Point(float(lng), float(lat))
-
-    flood_level = 0
-    for s, p in flood_shapes:
-        if s.contains(pt) or s.distance(pt) < 0.00045:  # ~50m buffer
-            code = p.get("code")
-            if code == "HF":
-                flood_level = 2
-                break
-            elif code == "MF" and flood_level < 1:
-                flood_level = 1
-
-    landslide_level = 0
-    for s, p in landslide_shapes:
-        if s.contains(pt) or s.distance(pt) < 0.00045:
-            code = p.get("code")
-            if code == "HL":
-                landslide_level = 2
-                break
-            elif code == "ML" and landslide_level < 1:
-                landslide_level = 1
-
-    return flood_level, landslide_level
+    """Legacy numeric encoding from new zones; F means susceptible, not high."""
+    from services.hazard_risk_service import assess_station_hazards
+    assessment = assess_station_hazards(lat, lng, '', [])
+    return assessment['flood_level'], assessment['landslide_level']
 
 
 def encode_source_type(source_type_str: str, name_str: str = "") -> int:

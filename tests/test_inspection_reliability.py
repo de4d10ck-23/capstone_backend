@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, AsyncMock
 from test_push_delivery import load_functions
 from test_notification_reads import HTTPException
 
@@ -21,7 +21,7 @@ class InspectionReliabilityTests(unittest.TestCase):
             id='source', barangay='Hantag', latitude=10.1, longitude=124.8)]
         self.db = SimpleNamespace(table=lambda name: self.tables[name])
         self.scope = load_functions('routers/inspections.py', {'create_inspection', 'update_inspection'},
-                                   get_supabase=lambda: self.db, HTTPException=HTTPException)
+                                   get_supabase=lambda: self.db, HTTPException=HTTPException, notify_staff=AsyncMock(), notify_linked_resident_outcome=AsyncMock())
         self.actor = dict(id='inspector', role='sanitization_inspector')
 
     def update(self, patch):

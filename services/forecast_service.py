@@ -17,7 +17,9 @@ METRICS_PATH = os.path.join(BACKEND_ROOT, "ml", "model_evaluation_metrics.json")
 from core.database import get_supabase
 from services.weather_service import get_forecast_weather
 from services.push_service import broadcast_push_notification
-from ml.dataset import encode_source_type, get_station_hazard_levels, FEATURE_COLUMNS
+from ml.dataset import encode_source_type, FEATURE_COLUMNS
+from services.hazard_risk_service import (assess_station_hazards, apply_hazard_adjustment,
+    fetch_hazard_records, load_weights, HAZARD_MODEL_VERSION)
 
 _cached_model_payload: Optional[Dict[str, Any]] = None
 
@@ -104,6 +106,10 @@ def get_model_status() -> Dict[str, Any]:
         "cross_validation_5fold": metrics.get("cross_validation_5fold", {}),
         "held_out_test_metrics": metrics.get("held_out_test_metrics", {}),
         "total_samples": metrics.get("total_samples", 0),
+        "hazard_model_version": HAZARD_MODEL_VERSION,
+        "hazard_weights": load_weights(),
+        "score_kind": "uncalibrated_hybrid_risk_index",
+        "hazard_method": "Study map and designated-barangay inventory; legacy RF hazard inputs held at zero to avoid double counting. Existing RF metrics describe the base model only.",
     }
 
 
@@ -142,11 +148,12 @@ async def predict_station_risk(
     forecast_date: Optional[str] = None,
     station_data: Optional[dict] = None,
     config: Optional[dict] = None,
+    hazard_records: Optional[list] = None,
 ) -> Dict[str, Any]:
     """
     Perform real-time machine learning inference for a given water station:
     1. Retrieve station coordinates and source type
-    2. Retrieve official GIS flood and landslide susceptibility levels
+    2. Assess new study-map zones and same-barangay mapped sources
     3. Retrieve live local meteorological conditions
     4. Compute model.predict_proba()
     5. Evaluate against configurable thresholds
@@ -167,8 +174,10 @@ async def predict_station_risk(
     station_name = station.get("full_name") or station.get("name") or ""
     barangay = station.get("barangay") or ""
 
-    # Official GIS hazard susceptibility
-    flood_level, landslide_level = get_station_hazard_levels(lat, lng)
+    records = fetch_hazard_records() if hazard_records is None else hazard_records
+    hazard_assessment = assess_station_hazards(lat, lng, barangay, records)
+    flood_level = hazard_assessment['flood_level']
+    landslide_level = hazard_assessment['landslide_level']
 
     # All model inputs use daily totals, including today.
     weather_data = await get_forecast_weather(forecast_date, lat, lng)
@@ -182,8 +191,8 @@ async def predict_station_risk(
 
     # Prepare feature vector matching FEATURE_COLUMNS
     feature_vector = [
-        flood_level,
-        landslide_level,
+        0,  # Neutralize legacy hazard inputs; new explicit weights apply below.
+        0,
         rf_24h,
         rf_48h,
         temp,
@@ -198,7 +207,8 @@ async def predict_station_risk(
 
     pipeline = payload["pipeline"]
     proba = pipeline.predict_proba([feature_vector])[0]
-    risk_score = round(float(proba[1]), 4)
+    adjustment = apply_hazard_adjustment(float(proba[1]), hazard_assessment, rf_48h)
+    risk_score = adjustment['risk_score']
 
     # Load thresholds
     cfg = config if config is not None else get_active_config()
@@ -209,27 +219,21 @@ async def predict_station_risk(
     if risk_score < threshold_low:
         predicted_status = "safe"
         risk_level = "Low"
-        advisory = "Water parameters indicate clean, potable condition with minimal microbial runoff risk."
+        advisory = "Low estimated environmental risk. This forecast does not establish drinking-water safety; use current water test results."
     elif risk_score <= threshold_high:
         predicted_status = "warning"
         risk_level = "Medium (At Risk)"
         advisory = "Caution advised: Environmental indicators suggest moderate risk of surface runoff infiltration."
     else:
         predicted_status = "undrinkable"
-        risk_level = "High (Contaminated)"
-        advisory = "High Contamination Risk: Elevated probability of microbial infiltration. Precautionary boiling strongly advised."
+        risk_level = "High (At Risk)"
+        advisory = "High estimated environmental risk. Verify with sanitary inspection and water testing; this forecast does not confirm contamination."
 
-    # Identify primary risk contributors based on official parameters
-    risk_factors = []
-    if flood_level == 2:
-        risk_factors.append("Station is located inside High Flood Susceptibility zone (DENR-MGB)")
-    elif flood_level == 1:
-        risk_factors.append("Station is located inside Moderate Flood Susceptibility zone (DENR-MGB)")
-
-    if landslide_level == 2:
-        risk_factors.append("Station is located inside High Landslide Susceptibility zone (DENR-MGB)")
-    elif landslide_level == 1:
-        risk_factors.append("Station is located inside Moderate Landslide Susceptibility zone (DENR-MGB)")
+    risk_factors = [f"{c['label']}: weighted exposure {c['contribution']:.3f}"
+                    + (" (estimated image continuation)" if c['inferred'] else "")
+                    for c in hazard_assessment['contributions'] if c['contribution'] > 0]
+    if hazard_assessment['coverage'] != 'mapped':
+        risk_factors.append("Natural-hazard coverage: " + hazard_assessment['coverage'].replace('_', ' '))
 
     if rf_24h >= 15.0 or rf_48h >= 30.0:
         risk_factors.append(f"Elevated rainfall ({rf_24h} mm in 24h, {rf_48h} mm in 48h) inducing surface runoff")
@@ -246,6 +250,9 @@ async def predict_station_risk(
         "barangay": barangay,
         "coordinates": {"latitude": lat, "longitude": lng},
         "risk_probability": risk_score,
+        "hazard_model_version": HAZARD_MODEL_VERSION,
+        "hazard_assessment": hazard_assessment,
+        "risk_breakdown": adjustment,
         "risk_percentage": round(risk_score * 100, 1),
         "predicted_status": predicted_status,
         "risk_level": risk_level,
@@ -256,9 +263,9 @@ async def predict_station_risk(
         },
         "environmental_metrics": {
             "flood_susceptibility_level": flood_level,
-            "flood_susceptibility_label": "High" if flood_level == 2 else ("Moderate" if flood_level == 1 else "Low/None"),
+            "flood_susceptibility_label": hazard_assessment['flood_label'],
             "landslide_susceptibility_level": landslide_level,
-            "landslide_susceptibility_label": "High" if landslide_level == 2 else ("Moderate" if landslide_level == 1 else "Low/None"),
+            "landslide_susceptibility_label": hazard_assessment['landslide_label'],
             "rainfall_24h_mm": rf_24h,
             "rainfall_48h_mm": rf_48h,
             "temperature_celsius": temp,
@@ -387,8 +394,8 @@ async def run_barangay_surveillance_and_alert(
 
             title = f"🚨 Water Quality Alert: Contamination Risk in Brgy. {b_name}"
             message = (
-                f"Machine learning surveillance detected high contamination probability (peak {max_risk}%) "
-                f"for {len(new_items)} water source(s): {names_summary}. Precautionary water boiling is strongly advised."
+                f"Forecast surveillance flagged high environmental risk (peak index {max_risk}/100) "
+                f"for {len(new_items)} water source(s): {names_summary}. Follow local water advisories; water testing is needed to confirm contamination."
             )
 
             # 1) In-app notification record (failure here must not block the push)

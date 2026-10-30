@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from test_push_delivery import load_functions
+from hazard_test_helpers import hazard_dependencies
 
 
 class ConsistencyTests(unittest.TestCase):
@@ -37,7 +38,7 @@ class ConsistencyTests(unittest.TestCase):
         pipeline = Mock()
         scope = load_functions('services/forecast_service.py', {'predict_station_risk'},
             _today_str=lambda: '2026-10-28', get_forecast_weather=weather,
-            get_station_hazard_levels=lambda *_: (0, 0), encode_source_type=lambda *_: 1,
+            **hazard_dependencies(), encode_source_type=lambda *_: 1,
             load_model_payload=lambda: {'pipeline': pipeline})
         for probability, status in [(.2999, 'safe'), (.3, 'warning'), (.7, 'warning'), (.7001, 'undrinkable')]:
             with self.subTest(probability=probability):

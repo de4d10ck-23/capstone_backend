@@ -6,6 +6,7 @@ from core.database import get_supabase
 from core.dependencies import get_current_user, require_roles
 from core.storage import upload_to_supabase, delete_from_supabase
 from models.resident_report import ResidentReportCreate, ResidentReportAction
+from services.workflow_notifications import notify_staff, notify_resident_outcome
 
 router = APIRouter(prefix="/api/resident-reports", tags=["Resident Reports"])
 
@@ -142,6 +143,12 @@ async def submit_resident_report(
     row = result.data[0]
     row["image_url"] = img_url
     row["photo_url"] = img_url
+    await notify_staff(
+        ["barangay_official"], "New water source submission" if report_type == "unregistered_source" else "New concern received",
+        f"A new submission in {row.get('barangay') or 'your barangay'} needs review.",
+        "/water-sources" if report_type == "unregistered_source" else "/validate-reports",
+        f"resident-report-{row['id']}", barangay=row.get("barangay"),
+    )
     return {"success": True, "message": "Report submitted successfully", "data": row}
 
 
@@ -208,33 +215,12 @@ async def update_resident_report(
             raise HTTPException(status_code=409, detail="This report changed on another device. Refresh and try again.")
         report = result.data[0]
 
-    # If completed or resolved (e.g. marked done by brgy or registered into official registry by CHU), notify resident
-    if status in ("completed", "resolved", "done"):
-        try:
-            notif_msg = reason or "Your report has been processed and marked Done. Review the recorded findings for water safety information."
-            sb.table("notifications").insert({
-                "title": f"Report Processing Completed: {report.get('title') or 'Water Source'}",
-                "message": f"Brgy. {report.get('barangay')}: {notif_msg}",
-                "type": "report_status",
-                "barangay": report.get("barangay"),
-                "target_roles": ["resident"],
-                "created_by": current_user["id"]
-            }).execute()
-        except Exception as ex:
-            print("Auto-create completed notification failed:", ex)
-    elif status == "dismissed":
-        try:
-            notif_msg = reason or "Your submitted report has been reviewed and dismissed by your Barangay Official."
-            sb.table("notifications").insert({
-                "title": f"Report Dismissed: {report.get('title') or 'Water Concern'}",
-                "message": f"Brgy. {report.get('barangay')}: {notif_msg}",
-                "type": "report_status",
-                "barangay": report.get("barangay"),
-                "target_roles": ["resident"],
-                "created_by": current_user["id"]
-            }).execute()
-        except Exception as ex:
-            print("Auto-create dismissed notification failed:", ex)
+    if status != old_status:
+        if status == "escalated" and old_status not in ("escalated", "assigned", "in_progress"):
+            await notify_staff(["sanitization_inspector"], "New concern forwarded to CHU",
+                               "A barangay concern is ready for inspection.", "/inspections",
+                               f"forwarded-concern-{report_id}")
+        await notify_resident_outcome(report)
 
     return {"success": True, "message": f"Report updated to {status}", "data": report}
 

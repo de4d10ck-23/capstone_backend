@@ -13,7 +13,7 @@ class WorkflowTests(unittest.TestCase):
             {"id":"report", "status":status, "barangay":"Combado"}]
         db.rpc.return_value.execute.return_value.data = {"id":"report", "status":"escalated"}
         scope = load_functions("routers/resident_reports.py", {"update_resident_report"},
-            get_supabase=lambda: db, HTTPException=HTTPException)
+            get_supabase=lambda: db, HTTPException=HTTPException, notify_staff=AsyncMock(), notify_resident_outcome=AsyncMock(), notify_linked_resident_outcome=AsyncMock())
         return db, scope, {"id":"staff", "role":role, "barangay":"Combado"}
 
     def test_forwarding_uses_atomic_database_operation(self):
@@ -55,7 +55,7 @@ class WorkflowTests(unittest.TestCase):
     def test_pending_inspection_cannot_skip_processing(self):
         db = Mock()
         db.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"id":"ticket", "status":"pending"}]
-        scope = load_functions("routers/inspections.py", {"update_inspection"}, get_supabase=lambda: db, HTTPException=HTTPException)
+        scope = load_functions("routers/inspections.py", {"update_inspection"}, get_supabase=lambda: db, HTTPException=HTTPException, notify_staff=AsyncMock(), notify_resident_outcome=AsyncMock(), notify_linked_resident_outcome=AsyncMock())
         with self.assertRaises(HTTPException) as err:
             asyncio.run(scope["update_inspection"]("ticket", {"status":"completed", "notes":"Findings"}, {"id":"inspector", "role":"sanitization_inspector"}))
         self.assertEqual(err.exception.status_code, 409)
@@ -64,7 +64,7 @@ class WorkflowTests(unittest.TestCase):
     def test_inspector_cannot_take_another_inspectors_ticket(self):
         db = Mock()
         db.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"id":"ticket", "status":"assigned", "assigned_to":"other"}]
-        scope = load_functions("routers/inspections.py", {"update_inspection"}, get_supabase=lambda: db, HTTPException=HTTPException)
+        scope = load_functions("routers/inspections.py", {"update_inspection"}, get_supabase=lambda: db, HTTPException=HTTPException, notify_staff=AsyncMock(), notify_resident_outcome=AsyncMock(), notify_linked_resident_outcome=AsyncMock())
         with self.assertRaises(HTTPException) as err:
             asyncio.run(scope["update_inspection"]("ticket", {"status":"in_progress"}, {"id":"inspector", "role":"sanitization_inspector"}))
         self.assertEqual(err.exception.status_code, 409)
@@ -73,7 +73,7 @@ class WorkflowTests(unittest.TestCase):
         db = Mock()
         db.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"id":"ticket", "status":"in_progress", "assigned_to":"inspector"}]
         db.table.return_value.update.return_value.eq.return_value.eq.return_value.eq.return_value.execute.return_value.data = []
-        scope = load_functions("routers/inspections.py", {"update_inspection"}, get_supabase=lambda: db, HTTPException=HTTPException)
+        scope = load_functions("routers/inspections.py", {"update_inspection"}, get_supabase=lambda: db, HTTPException=HTTPException, notify_staff=AsyncMock(), notify_resident_outcome=AsyncMock(), notify_linked_resident_outcome=AsyncMock())
         with self.assertRaises(HTTPException) as err:
             asyncio.run(scope["update_inspection"]("ticket", {"status":"completed", "notes":"Findings"}, {"id":"inspector", "role":"sanitization_inspector"}))
         self.assertEqual(err.exception.status_code, 409)
@@ -96,7 +96,7 @@ class WorkflowTests(unittest.TestCase):
                 db.table.return_value.update.return_value.eq.return_value.eq.return_value.is_.return_value.execute.return_value.data = [
                     {"id": "ticket", "status": "cancelled"}]
                 scope = load_functions("routers/inspections.py", {"update_inspection"},
-                    get_supabase=lambda: db, HTTPException=HTTPException)
+                    get_supabase=lambda: db, HTTPException=HTTPException, notify_staff=AsyncMock(), notify_resident_outcome=AsyncMock(), notify_linked_resident_outcome=AsyncMock())
                 result = asyncio.run(scope["update_inspection"]("ticket",
                     {"status": "cancelled", "notes": "Dismissal reason: Duplicate request"},
                     {"id": "inspector", "role": "sanitization_inspector"}))
@@ -112,7 +112,7 @@ class WorkflowTests(unittest.TestCase):
         db.table.return_value.update.return_value.eq.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
             {"id": "ticket", "status": "completed"}]
         scope = load_functions("routers/inspections.py", {"update_inspection"},
-            get_supabase=lambda: db, HTTPException=HTTPException)
+            get_supabase=lambda: db, HTTPException=HTTPException, notify_staff=AsyncMock(), notify_resident_outcome=AsyncMock(), notify_linked_resident_outcome=AsyncMock())
         result = asyncio.run(scope["update_inspection"]("ticket", {"status": "completed"},
             {"id": "inspector", "role": "sanitization_inspector"}))
         self.assertEqual(result["data"]["status"], "completed")

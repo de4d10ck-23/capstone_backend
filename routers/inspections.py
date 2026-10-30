@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from core.database import get_supabase
 from core.dependencies import get_current_user, require_admin, require_roles
 from models.inspection import InspectionCreate, InspectionAssign, InspectionComplete
+from services.workflow_notifications import notify_staff, notify_linked_resident_outcome
 
 router = APIRouter(prefix="/api/inspections", tags=["Inspections"])
 
@@ -68,6 +69,9 @@ async def create_inspection(
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to create inspection request")
 
+    await notify_staff(["sanitization_inspector"], "New inspection request",
+                       "A new water source inspection request needs action.", "/inspections",
+                       f"inspection-{result.data[0]['id']}")
     return {"success": True, "message": "Inspection request submitted", "data": result.data[0]}
 
 
@@ -154,7 +158,10 @@ async def update_inspection(
 
     updated_inspection = result.data[0]
 
-    # The database trigger updates the linked report in the same transaction.
+    # The database trigger updates the linked report and its private notification.
+    if status in ("completed", "cancelled") and current.get("resident_report_id"):
+        await notify_linked_resident_outcome(current["resident_report_id"])
+
     return {"success": True, "message": "Inspection updated successfully", "data": updated_inspection}
 
 

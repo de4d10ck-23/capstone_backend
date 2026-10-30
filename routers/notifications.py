@@ -78,6 +78,16 @@ async def send_test_push(
     return {"success": res["sent"] > 0, "message": f"Push service accepted {res['sent']} test notification(s); {res['failed']} failed.", "details": res}
 
 
+def notification_visible_to(row, user):
+    target = row.get("target_user_id")
+    if target:
+        return bool(user and str(target) == str(user.get("id")))
+    if row.get("type") == "report_status":
+        return False
+    roles = row.get("target_roles") or []
+    return not roles or (user is not None and user.get("role") in roles)
+
+
 def _visible_notifications(current_user, barangay=None):
     """Use the same paginated scope for the list, badge, and mark-all action."""
     sb = get_supabase()
@@ -92,7 +102,9 @@ def _visible_notifications(current_user, barangay=None):
         page = query.range(offset, offset + 499).execute().data or []
         rows.extend(page)
         if len(page) < 500:
-            return rows
+            # Legacy report-status broadcasts were not addressed to their owner.
+            # Hide them rather than exposing another resident's outcome.
+            return [row for row in rows if notification_visible_to(row, current_user)]
         offset += 500
 
 

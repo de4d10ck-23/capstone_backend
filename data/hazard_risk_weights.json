@@ -1,0 +1,17 @@
+{
+  "version": "study-hazards-v1",
+  "calibration": "Provisional engineering weights; not calibrated contamination probabilities or regulatory setback distances.",
+  "natural": {"F": 0.30, "HL": 0.20, "ML": 0.10, "LL": 0.03, "OUT": 0.0},
+  "sources": {
+    "livestock": {"weight": 0.20, "radius_m": 250},
+    "sanitation": {"weight": 0.25, "radius_m": 150},
+    "agriculture": {"weight": 0.10, "radius_m": 250},
+    "waste": {"weight": 0.22, "radius_m": 250},
+    "waterways": {"weight": 0.08, "radius_m": 150},
+    "other": {"weight": 0.0, "radius_m": 150}
+  },
+  "inferred_factor": 0.5,
+  "maximum_combined_weight": 0.65,
+  "dry_weather_factor": 0.5,
+  "full_runoff_rainfall_48h_mm": 30.0
+}

@@ -2,6 +2,12 @@
 
 Apply the SQL files in the connected Supabase project's SQL Editor before deploying the corresponding code.
 
+## Workflow push and private resident outcomes (20261030_workflow_notifications.sql)
+
+Apply after the CHU workflow and notification-read migrations, then deploy the backend and staff frontend. The new trigger saves one private inbox notification when a concern or proposed water source is marked Done or Dismissed, including linked inspection completion/cancellation. Repeated outcomes are deduplicated by event key and share the existing cross-device read receipts. It applies to new status changes, not historical closed submissions. Legacy barangay-wide report-status notifications are hidden because they have no reliable recipient ID. The notification API enforces recipient and role visibility; direct anonymous/authenticated Supabase table reads are revoked (this app uses its authenticated backend and service role).
+
+Staff select **Enable push alerts** in the portal header and allow browser notifications on each device. Previously allowed devices register again after signing in; signing out unsubscribes that browser. Push requires HTTPS or localhost and browser support. New resident submissions alert officials of the relevant barangay; forwarded concerns and direct inspection requests alert active inspectors; reports sent for review alert active CHU doctors. Resident outcomes push only to the submitting account's subscribed devices and remain available in the inbox without browser permission. Push delivery is best effort: failed device delivery is logged without undoing the workflow. No email is sent. Local checks do not send real notifications.
+
 ## Resident email authentication (20261029_resident_email_auth.sql)
 
 Apply before deploying the resident email-verification/password-reset backend. Adds private pending email tokens, atomic confirmation/reset functions, cross-worker request limits, verified-account metadata, and a session version for reset revocation. Existing accounts remain verified; admin-created accounts bypass confirmation. Public registration creates an account only after confirmation. See [RESIDENT_EMAIL_SETUP.md](../RESIDENT_EMAIL_SETUP.md) for Resend sender verification, backend secrets, and deployment steps.

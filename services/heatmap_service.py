@@ -6,14 +6,13 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
-import shapely.geometry
-from shapely.geometry import shape, Point
-
 from core.database import get_supabase
 from core.constants import get_barangay_population, MAX_BARANGAY_POPULATION
 from core.spatial import haversine_distance
-from ml.dataset import encode_source_type, get_station_hazard_levels
-from services.forecast_service import load_model_payload, get_active_config
+from ml.dataset import encode_source_type
+from services.forecast_service import load_model_payload
+from services.hazard_risk_service import (load_study_data, fetch_hazard_records,
+    assess_station_hazards, apply_hazard_adjustment)
 from services.weather_service import get_live_weather, MAASIN_DEFAULT_LAT, MAASIN_DEFAULT_LNG
 
 logger = logging.getLogger(__name__)
@@ -109,28 +108,11 @@ def get_scheduler_status() -> Dict[str, Any]:
 
 
 def load_official_hazard_datasets() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Load pre-processed official flood and landslide GeoJSONs derived from Maasin_LandFlood."""
-    flood_path = os.path.join(DATA_DIR, "maasin_flood_hazards.json")
-    landslide_path = os.path.join(DATA_DIR, "maasin_landslide_hazards.json")
-
-    flood_data = {"type": "FeatureCollection", "features": []}
-    landslide_data = {"type": "FeatureCollection", "features": []}
-
-    if os.path.exists(flood_path):
-        try:
-            with open(flood_path, "r", encoding="utf-8") as f:
-                flood_data = json.load(f)
-        except Exception as e:
-            logger.warning(f"Could not load {flood_path}: {e}")
-
-    if os.path.exists(landslide_path):
-        try:
-            with open(landslide_path, "r", encoding="utf-8") as f:
-                landslide_data = json.load(f)
-        except Exception as e:
-            logger.warning(f"Could not load {landslide_path}: {e}")
-
-    return flood_data, landslide_data
+    """Compatibility endpoint using the same new study dataset as forecasts."""
+    data = load_study_data()
+    return tuple({'type': 'FeatureCollection', 'metadata': data['metadata'],
+                  'features': [f for f in data['features'] if f['properties']['kind'] == kind]}
+                 for kind in ('flood', 'landslide'))
 
 
 def densify_line(coords: List[List[float]], step_meters: float = 30.0) -> List[Tuple[float, float]]:
@@ -193,34 +175,9 @@ def densify_polygon(coords: Any, step_meters: float = 40.0) -> List[Tuple[float,
     return boundary_points + internal_points
 
 
-def get_hazard_risk_weight(risk_level: str, hazard_type: str) -> float:
-    """Calculate normalized heat weight (0.1 to 1.0) for a hazard."""
-    base = 0.7
-    rl = (risk_level or "").lower()
-    if "high" in rl or "critical" in rl:
-        base = 1.0
-    elif "medium" in rl or "moderate" in rl:
-        base = 0.65
-    elif "low" in rl:
-        base = 0.35
-
-    ht = (hazard_type or "").lower()
-    if any(k in ht for k in ["latrine", "septic", "dumpsite", "piggery", "carcass"]):
-        type_mult = 1.0
-    elif any(k in ht for k in ["river", "stream", "drainage", "canal"]):
-        type_mult = 0.85
-    elif any(k in ht for k in ["farmland", "ag", "agricultural", "field"]):
-        type_mult = 0.75
-    else:
-        type_mult = 0.8
-
-    return round(min(1.0, max(0.1, base * type_mult)), 2)
-
-
 async def generate_hazard_heatmap_geojson() -> Dict[str, Any]:
     """
-    Generate unified GeoJSON FeatureCollection representing official Maasin Flood and Landslide
-    hazard susceptibility zones loaded from Maasin_LandFlood (DENR-MGB official study area).
+    Return study-map flood and image-derived landslide zones, including estimates.
     """
     flood_data, landslide_data = load_official_hazard_datasets()
     combined_features = []
@@ -234,7 +191,7 @@ async def generate_hazard_heatmap_geojson() -> Dict[str, Any]:
     return {
         "type": "FeatureCollection",
         "metadata": {
-            "source": "Maasin_LandFlood (DENR-MGB Study Area)",
+            "source": "Maasin study map: supplied flood vectors and approximate image-derived landslide zones",
             "total_flood_zones": len(flood_data.get("features", [])),
             "total_landslide_zones": len(landslide_data.get("features", [])),
             "total_features": len(combined_features),
@@ -247,7 +204,7 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
     """
     Generate GeoJSON Point FeatureCollection representing microbial and ML contamination
     risk across all monitored water locations using high-performance vectorized batch inference
-    augmented with official spatial hazard zone vulnerability weighting.
+    augmented with shared provisional study-map and mapped-source weighting.
     """
     sb = get_supabase()
     try:
@@ -257,30 +214,7 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
         logger.warning(f"Error loading water locations for heatmap: {e}")
         locations = []
 
-    try:
-        res_haz = sb.table("contamination_hazards").select("*").execute()
-        hazards = res_haz.data or []
-    except Exception as e:
-        logger.warning(f"Error loading hazards for heatmap: {e}")
-        hazards = []
-
-    # Load official GIS hazard geometries for spatial vulnerability intersection
-    flood_data, landslide_data = load_official_hazard_datasets()
-    flood_shapes = []
-    for f in flood_data.get("features", []):
-        if f.get("geometry"):
-            try:
-                flood_shapes.append((shape(f["geometry"]), f.get("properties", {})))
-            except Exception as e:
-                logger.debug(f"Invalid flood geometry: {e}")
-
-    landslide_shapes = []
-    for f in landslide_data.get("features", []):
-        if f.get("geometry"):
-            try:
-                landslide_shapes.append((shape(f["geometry"]), f.get("properties", {})))
-            except Exception as e:
-                logger.debug(f"Invalid landslide geometry: {e}")
+    hazards = fetch_hazard_records()
 
     # Get regional weather once for inference
     weather_data = await get_live_weather(MAASIN_DEFAULT_LAT, MAASIN_DEFAULT_LNG)
@@ -289,10 +223,7 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
     temp = float(weather_data.get("temperature_celsius") or 28.0)
     humidity = float(weather_data.get("humidity_percent") or 75.0)
 
-    # Get thresholds and model payload
-    cfg = get_active_config()
-    thresh_low = cfg.get("risk_threshold_low", 0.30)
-    thresh_high = cfg.get("risk_threshold_high", 0.65)
+    # Same baseline model as forecasts, with legacy hazard inputs neutralized.
     payload = load_model_payload()
     pipeline = payload.get("pipeline") if payload else None
 
@@ -310,110 +241,36 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
         except (ValueError, TypeError):
             continue
 
-        pt = Point(lng, lat)
-        flood_lvl = 0
-        for s, p in flood_shapes:
-            if s.contains(pt) or s.distance(pt) < 0.00045:
-                code = p.get("code")
-                if code == "HF":
-                    flood_lvl = 2
-                    break
-                elif code == "MF" and flood_lvl < 1:
-                    flood_lvl = 1
-
-        landslide_lvl = 0
-        for s, p in landslide_shapes:
-            if s.contains(pt) or s.distance(pt) < 0.00045:
-                code = p.get("code")
-                if code == "HL":
-                    landslide_lvl = 2
-                    break
-                elif code == "ML" and landslide_lvl < 1:
-                    landslide_lvl = 1
+        assessment = assess_station_hazards(lat, lng, loc.get('barangay'), hazards)
 
         source_code = encode_source_type(loc.get("source_type") or "", loc.get("full_name") or loc.get("name") or "")
 
         vec = [
-            flood_lvl,
-            landslide_lvl,
+            0,
+            0,
             rf_24h,
             rf_48h,
             temp,
             humidity,
             source_code,
         ]
-        valid_locs.append((loc, lng, lat, flood_lvl, landslide_lvl))
+        valid_locs.append((loc, lng, lat, assessment))
         feature_vectors.append(vec)
 
-    # Batch inference
-    probabilities = []
-    if pipeline and feature_vectors:
-        try:
-            probas = pipeline.predict_proba(feature_vectors)
-            probabilities = [float(p[1]) for p in probas]
-        except Exception as inf_err:
-            logger.error(f"Batch predict_proba error: {inf_err}")
-            probabilities = [0.1] * len(valid_locs)
-    else:
-        probabilities = [0.1] * len(valid_locs)
-
+    # Never manufacture a low-risk score when the model is unavailable.
+    if not pipeline:
+        raise RuntimeError('Prediction model is unavailable')
+    probabilities = [float(p[1]) for p in pipeline.predict_proba(feature_vectors)] if feature_vectors else []
     features = []
     stats = {"safe": 0, "warning": 0, "undrinkable": 0, "total": len(valid_locs)}
-
-    # Evaluate each station with official environmental hazard vulnerability weighting
-    for i, (loc, lng, lat, flood_lvl, landslide_lvl) in enumerate(valid_locs):
-        base_prob = round(probabilities[i], 4) if i < len(probabilities) else 0.1
-        pt = Point(lng, lat)
-
-        # Check intersection with official flood susceptibility zones (~50m buffer)
-        in_flood = None
-        for s, p in flood_shapes:
-            if s.contains(pt) or s.distance(pt) < 0.00045:
-                in_flood = p
-                break
-
-        # Check intersection with official landslide susceptibility zones (~50m buffer)
-        in_landslide = None
-        for s, p in landslide_shapes:
-            if s.contains(pt) or s.distance(pt) < 0.00045:
-                in_landslide = p
-                break
-
-        # Calculate hazard vulnerability weight multiplier
-        hazard_multiplier = 1.0
-        hazard_factors = []
-
-        if in_flood:
-            code = in_flood.get("code", "")
-            if code == "HF":
-                hazard_multiplier += 0.30
-                hazard_factors.append("High Flood Susceptibility")
-            elif code == "MF":
-                hazard_multiplier += 0.15
-                hazard_factors.append("Moderate Flood Susceptibility")
-            else:
-                hazard_multiplier += 0.05
-                hazard_factors.append("Low Flood Susceptibility")
-
-        if in_landslide:
-            code = in_landslide.get("code", "")
-            if code == "HL":
-                hazard_multiplier += 0.25
-                hazard_factors.append("High Landslide Susceptibility")
-            elif code == "ML":
-                hazard_multiplier += 0.12
-                hazard_factors.append("Moderate Landslide Susceptibility")
-
-        # Environmental weighting amplifies risk during rain/runoff events
-        vulnerability_weight = round(hazard_multiplier - 1.0, 3)
-        if rf_24h > 1.0 or rf_48h > 3.0:
-            risk_prob = min(0.99, base_prob * hazard_multiplier)
-        elif vulnerability_weight > 0.1:
-            risk_prob = min(0.99, base_prob * (1.0 + vulnerability_weight * 0.5))
-        else:
-            risk_prob = base_prob
-
-        risk_prob = round(risk_prob, 4)
+    for i, (loc, lng, lat, assessment) in enumerate(valid_locs):
+        base_prob = probabilities[i]
+        adjustment = apply_hazard_adjustment(base_prob, assessment, rf_48h)
+        risk_prob = adjustment['risk_score']
+        hazard_multiplier = risk_prob/base_prob if base_prob > 0 else 1.0
+        hazard_factors = [c['label'] for c in assessment['contributions'] if c['contribution'] > 0]
+        in_flood = assessment['flood_level'] > 0
+        in_landslide = any(c.get('kind') == 'landslide' for c in assessment['contributions'])
 
         # DIRECT SANITATION INSPECTOR STATUS:
         # Ground-truth status recorded by sanitation inspector and certified laboratory exams
@@ -480,10 +337,12 @@ async def generate_water_contamination_heatmap_geojson() -> Tuple[Dict[str, Any]
                 "risk_probability": risk_prob,
                 "vulnerability_multiplier": round(hazard_multiplier, 2),
                 "vulnerability_factors": hazard_factors,
-                "in_flood_zone": in_flood is not None,
-                "flood_risk_level": in_flood.get("risk_level", "None") if in_flood else "None",
-                "in_landslide_zone": in_landslide is not None,
-                "landslide_risk_level": in_landslide.get("risk_level", "None") if in_landslide else "None",
+                "in_flood_zone": in_flood,
+                "flood_risk_level": assessment["flood_label"],
+                "in_landslide_zone": in_landslide,
+                "landslide_risk_level": assessment["landslide_label"],
+                "hazard_assessment": assessment,
+                "risk_breakdown": adjustment,
                 "coliform_count": float(coliform_val or 0) if isinstance(coliform_val, (int, float)) else (1.0 if has_coliform else 0.0),
                 "e_coli_count": float(e_coli_val or 0) if isinstance(e_coli_val, (int, float)) else (1.0 if has_ecoli else 0.0),
                 "weight": round(heat_weight, 4),

@@ -3,7 +3,7 @@ import copy
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from unittest.mock import patch
 
 from test_push_delivery import load_functions
@@ -52,7 +52,8 @@ class SavedForecastTests(unittest.TestCase):
             {'read_all', 'refresh_saved_forecasts', 'get_saved_forecasts'}, timedelta=timedelta, timezone=timezone,
             MANILA=timezone(timedelta(hours=8)), _refresh_lock=asyncio.Lock(),
             get_supabase=lambda: client, load_model_payload=lambda: {'pipeline': True},
-            get_active_config=lambda: {}, predict_station_risk=self.predict)
+            get_active_config=lambda: {}, predict_station_risk=self.predict,
+            fetch_hazard_records=lambda: [], HAZARD_MODEL_VERSION='study-hazards-v1')
 
     def refresh(self): return asyncio.run(self.scope['refresh_saved_forecasts']())
 
@@ -126,6 +127,24 @@ class SavedForecastTests(unittest.TestCase):
             restored = self.scope['get_saved_forecasts'](day, 'Batuan')
         self.assertEqual(len(restored['results']), 1)
         self.assertEqual(restored['results'][0]['station_id'], station['id'])
+
+    def test_previous_hazard_model_predictions_are_stale_even_when_recent(self):
+        self.refresh()
+        row = self.db['water_forecasts'][0]
+        scheduler = SimpleNamespace(get_run_interval_minutes=lambda: 60)
+        with patch.dict('sys.modules', {'services.heatmap_service': scheduler}):
+            old = self.scope['get_saved_forecasts'](row['forecast_date'])
+            self.assertTrue(old['results'][0]['stale'])
+            row['prediction']['hazard_model_version'] = 'study-hazards-v1'
+            new = self.scope['get_saved_forecasts'](row['forecast_date'])
+            self.assertFalse(new['results'][0]['stale'])
+
+    def test_unavailable_hazard_inventory_preserves_saved_forecasts(self):
+        self.refresh()
+        saved = copy.deepcopy(self.db['water_forecasts'])
+        self.scope['fetch_hazard_records'] = Mock(side_effect=RuntimeError('Inventory unavailable'))
+        self.assertEqual(self.refresh()['status'], 'failed')
+        self.assertEqual(self.db['water_forecasts'], saved)
 
 
 if __name__ == '__main__': unittest.main()

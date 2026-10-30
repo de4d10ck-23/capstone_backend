@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from test_push_delivery import load_functions
+from hazard_test_helpers import hazard_dependencies
 
 
 class ForecastWeatherTests(unittest.TestCase):
@@ -77,12 +78,12 @@ class ForecastWeatherTests(unittest.TestCase):
         database = Mock(side_effect=AssertionError("Unexpected database access"))
         scope = load_functions("services/forecast_service.py", {"predict_station_risk"},
             get_supabase=database, get_live_weather=live, get_forecast_weather=weather,
-            get_station_hazard_levels=lambda *_: (1, 2), encode_source_type=lambda *_: 0,
+            **hazard_dependencies(), encode_source_type=lambda *_: 0,
             load_model_payload=lambda: {"pipeline": pipeline})
         result = asyncio.run(scope["predict_station_risk"]("station-1",
             forecast_date=self.days[8], station_data={"latitude": 10.13, "longitude": 124.87},
             config={"risk_threshold_low": 0.3, "risk_threshold_high": 0.65}))
-        pipeline.predict_proba.assert_called_once_with([[1, 2, 12, 20, 26, 88, 0]])
+        pipeline.predict_proba.assert_called_once_with([[0, 0, 12, 20, 26, 88, 0]])
         self.assertEqual(result["forecast_date"], self.days[8])
         self.assertEqual(result["predicted_status"], "undrinkable")
         live.assert_not_awaited()

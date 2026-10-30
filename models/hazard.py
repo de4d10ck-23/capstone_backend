@@ -1,5 +1,7 @@
-from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, Any
+from pydantic import BaseModel, Field, ConfigDict, StringConstraints, field_validator
+from typing import Optional, Any, Annotated
+
+BarangayName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class HazardCreate(BaseModel):
@@ -9,7 +11,7 @@ class HazardCreate(BaseModel):
     hazard_type: str  # 'latrine', 'septic_tank', 'piggery', 'river', 'stream', 'drainage', 'agricultural_land', 'farmland', 'other'
     geometry_type: str  # 'Point', 'LineString', 'Polygon'
     coordinates: Any  # [lng, lat] for Point, [[lng, lat], ...] for LineString, [[[lng, lat], ...]] for Polygon
-    barangay: Optional[str] = None
+    barangay: BarangayName
     risk_level: Optional[str] = "high"  # 'high', 'medium', 'low'
     notes: Optional[str] = None
 
@@ -19,5 +21,13 @@ class HazardUpdate(BaseModel):
 
     name: Optional[str] = None
     hazard_type: Optional[str] = None
+    barangay: Optional[BarangayName] = None
     risk_level: Optional[str] = None
     notes: Optional[str] = None
+
+    @field_validator("barangay")
+    @classmethod
+    def require_designation_if_supplied(cls, value):
+        if value is None:
+            raise ValueError("A designated barangay cannot be cleared")
+        return value

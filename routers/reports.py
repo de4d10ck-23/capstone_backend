@@ -1,3 +1,4 @@
+from services.workflow_notifications import notify_staff
 from typing import Annotated, Literal
 import logging
 
@@ -62,6 +63,40 @@ async def list_reports(current_user: Annotated[dict, Depends(require_staff)]):
     except Exception as exc:
         logger.exception("Report archive unavailable")
         raise HTTPException(503, "Report archive is unavailable. Check the report snapshots and review workflow migrations.") from exc
+
+
+@router.get("/pending-count")
+async def pending_report_count(current_user: Annotated[dict, Depends(require_staff)]):
+    """Small, role-scoped count of the queue awaiting its next review action."""
+    role = current_user.get('role')
+    if role not in ('barangay_official', 'sanitization_inspector', 'city_health_officer'):
+        raise HTTPException(403, 'This account has no staff report queue.')
+    if role == 'barangay_official' and not (current_user.get('barangay') or '').strip():
+        raise HTTPException(403, 'Your account has no assigned barangay.')
+    try:
+        sb = get_supabase()
+        if role == 'barangay_official':
+            query = (sb.table('resident_reports').select('id', count='exact', head=True)
+                     .eq('barangay', current_user['barangay'])
+                     .or_('and(or(status.is.null,status.eq.pending,status.eq.""),or(type.is.null,type.neq.unregistered_source))'))
+            route = '/validate-reports'
+        elif role == 'sanitization_inspector':
+            # Shared city-wide queue, exactly like the Pending Review tab.
+            # Count tickets only: a linked resident report is not a second item.
+            query = (sb.table('inspection_requests').select('id', count='exact', head=True)
+                     .or_('status.is.null,status.eq.pending,status.eq.assigned,status.eq.""'))
+            route = '/inspections'
+        else:
+            query = (sb.table('reports').select('id', count='exact', head=True)
+                     .eq('review_status', 'submitted').not_.is_('submitted_at', 'null'))
+            route = '/view-reports'
+        count = query.execute().count
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError('Report count unavailable')
+        return {'success': True, 'count': count, 'route': route}
+    except Exception as exc:
+        logger.exception('Pending report count unavailable')
+        raise HTTPException(503, 'Pending report count is unavailable.') from exc
 
 
 @router.post("/preview", response_class=HTMLResponse)
@@ -129,7 +164,13 @@ def report_transition(report_id, user, action, notes=None):
 
 @router.post("/{report_id}/send")
 async def send_report(report_id: str, current_user: Annotated[dict, Depends(require_roles("sanitization_inspector", "admin"))]):
-    return report_transition(report_id, current_user, "send")
+    before = saved_report(report_id, current_user)
+    result = report_transition(report_id, current_user, "send")
+    if not before.get("submitted_at"):
+        await notify_staff(["city_health_officer"], "New report received",
+                           "A report has been sent to you for review.", "/view-reports",
+                           f"doctor-report-{report_id}")
+    return result
 
 
 @router.post("/{report_id}/review/start")

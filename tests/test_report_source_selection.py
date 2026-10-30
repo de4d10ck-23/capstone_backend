@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, AsyncMock
 from test_push_delivery import load_functions
 from test_notification_reads import HTTPException
 
@@ -13,7 +13,7 @@ class ReportSourceSelectionTests(unittest.TestCase):
             dict(id='station', full_name='Spring', barangay='Batuan', latitude=10.13, longitude=124.87)]
         self.db.table.return_value.insert.return_value.execute.return_value.data = [{'id': 'report'}]
         self.submit = load_functions('routers/resident_reports.py', {'submit_resident_report'},
-            get_supabase=lambda: self.db, HTTPException=HTTPException)['submit_resident_report']
+            get_supabase=lambda: self.db, HTTPException=HTTPException, notify_staff=AsyncMock())['submit_resident_report']
         self.user = dict(id='resident', role='resident', barangay='Batuan')
         self.body = SimpleNamespace(location_id='station', category='request_inspection', type='concern',
             title='Inspection', description='Check water', image_url=None, photo_url=None,
