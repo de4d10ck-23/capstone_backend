@@ -7,6 +7,7 @@ from core.database import get_supabase
 from core.dependencies import require_admin, require_staff, get_optional_user
 from models.forecast import ForecastConfig
 from services.saved_forecast_service import get_saved_forecasts, refresh_saved_forecasts
+from services.weather_service import get_forecast_weather_timeline
 from services.forecast_service import (
     get_model_status,
     predict_station_risk,
@@ -27,6 +28,16 @@ from ml.train_model import run_training_tournament
 
 router = APIRouter(prefix="/api/forecast", tags=["Forecast"])
 logger = logging.getLogger(__name__)
+
+
+@router.get("/weather-timeline")
+async def get_weather_timeline():
+    """Public city-wide weather conditions for the eight forecast dates."""
+    try:
+        return {"success": True, "data": await get_forecast_weather_timeline()}
+    except Exception:
+        logger.exception("Could not read timeline weather")
+        raise HTTPException(503, "Daily weather conditions are temporarily unavailable.")
 
 
 @router.get("/map")

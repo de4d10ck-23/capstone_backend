@@ -11,6 +11,20 @@
     },
     "user_id": "ea2c770c-1bdd-4b32-bf62-478dbd49cbe7",
     "barangay": "hantag",
-    "updated_at": "2026-10-30T22:29:35.969928"
+    "updated_at": "2026-10-31T16:36:44.568599"
+  },
+  "https://fcm.googleapis.com/fcm/send/d8uwBloijF8:APA91bEP36Rvj3nky_PLQrXqiemRrM4pQXGGyD1h8DUNIyFU6qKXApY7hFfCrmtOYuzxfoqsrYMu7HVNO0mh75QQnHEzIHgrtmbW8N9r88HhORAGuVbmt32u-R_8lStA_SCptJhla9f_": {
+    "endpoint": "https://fcm.googleapis.com/fcm/send/d8uwBloijF8:APA91bEP36Rvj3nky_PLQrXqiemRrM4pQXGGyD1h8DUNIyFU6qKXApY7hFfCrmtOYuzxfoqsrYMu7HVNO0mh75QQnHEzIHgrtmbW8N9r88HhORAGuVbmt32u-R_8lStA_SCptJhla9f_",
+    "subscription": {
+      "endpoint": "https://fcm.googleapis.com/fcm/send/d8uwBloijF8:APA91bEP36Rvj3nky_PLQrXqiemRrM4pQXGGyD1h8DUNIyFU6qKXApY7hFfCrmtOYuzxfoqsrYMu7HVNO0mh75QQnHEzIHgrtmbW8N9r88HhORAGuVbmt32u-R_8lStA_SCptJhla9f_",
+      "expirationTime": null,
+      "keys": {
+        "p256dh": "BI5WxN42nvSJMgPfO2hBgWlORaQCHx34JkoowIXJ92Y_XiuDeoe-4Gu73EQGe2p0e9K3xwspppb5EPoEQXXhqo8",
+        "auth": "w5xy_FhQs4h3YvtYaYiJIw"
+      }
+    },
+    "user_id": "409d68d6-3736-4b57-a400-ea6e5311d4c0",
+    "barangay": "combado",
+    "updated_at": "2026-10-31T16:33:23.652928"
   }
 }

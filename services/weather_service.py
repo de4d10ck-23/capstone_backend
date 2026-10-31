@@ -19,6 +19,37 @@ CACHE_TTL_SECONDS = 600  # 10 minutes cache
 
 _FORECAST_CACHE: Dict[tuple, tuple] = {}
 _FORECAST_ERRORS: Dict[tuple, float] = {}
+_TIMELINE_WEATHER_CACHE: Dict[str, tuple] = {}
+
+
+async def get_forecast_weather_timeline() -> Dict[str, Any]:
+    """City-wide daily conditions for the map timeline, independent of risk predictions."""
+    today = datetime.now(timezone(timedelta(hours=8))).date()
+    key = today.isoformat()
+    cached = _TIMELINE_WEATHER_CACHE.get(key)
+    if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
+        return cached[1]
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": MAASIN_DEFAULT_LAT, "longitude": MAASIN_DEFAULT_LNG,
+            "timezone": "Asia/Manila", "forecast_days": 8, "daily": "weather_code",
+        })
+        response.raise_for_status()
+        daily = response.json().get("daily", {})
+    codes = dict(zip(daily.get("time", []), daily.get("weather_code", [])))
+    days = []
+    for offset in range(8):
+        day = (today + timedelta(days=offset)).isoformat()
+        code = codes.get(day)
+        if not isinstance(code, int) or isinstance(code, bool):
+            code = None
+        days.append({"date": day, "weather_code": code})
+    if all(day["weather_code"] is None for day in days):
+        raise RuntimeError("Daily weather conditions are unavailable.")
+    result = {"location": "Maasin City", "source": "Open-Meteo", "days": days}
+    _TIMELINE_WEATHER_CACHE.clear()
+    _TIMELINE_WEATHER_CACHE[key] = (time.time(), result)
+    return result
 
 
 async def get_forecast_weather(target_date: str, lat: float, lng: float) -> Dict[str, Any]:

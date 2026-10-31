@@ -1,5 +1,31 @@
 [
   {
+    "ran_at": "2026-10-31T08:34:48.220151+00:00",
+    "triggered_by": "startup_scheduler",
+    "evaluated": 121,
+    "contaminated": 4,
+    "warning": 87,
+    "newly_alerted_stations": 0,
+    "suppressed_duplicates": 0,
+    "notifications": 2,
+    "push_sent": 0,
+    "push_failed": 0,
+    "error": null
+  },
+  {
+    "ran_at": "2026-10-31T08:17:23.534357+00:00",
+    "triggered_by": "startup_scheduler",
+    "evaluated": 121,
+    "contaminated": 4,
+    "warning": 87,
+    "newly_alerted_stations": 0,
+    "suppressed_duplicates": 0,
+    "notifications": 2,
+    "push_sent": 0,
+    "push_failed": 0,
+    "error": null
+  },
+  {
     "ran_at": "2026-10-30T14:27:11.516818+00:00",
     "triggered_by": "scheduled_cron",
     "evaluated": 121,
@@ -222,32 +248,6 @@
   },
   {
     "ran_at": "2026-10-29T13:20:04.207709+00:00",
-    "triggered_by": "startup_scheduler",
-    "evaluated": 121,
-    "contaminated": 3,
-    "warning": 79,
-    "newly_alerted_stations": 0,
-    "suppressed_duplicates": 1,
-    "notifications": 1,
-    "push_sent": 0,
-    "push_failed": 0,
-    "error": null
-  },
-  {
-    "ran_at": "2026-10-29T13:15:02.428765+00:00",
-    "triggered_by": "startup_scheduler",
-    "evaluated": 121,
-    "contaminated": 3,
-    "warning": 79,
-    "newly_alerted_stations": 0,
-    "suppressed_duplicates": 1,
-    "notifications": 1,
-    "push_sent": 0,
-    "push_failed": 0,
-    "error": null
-  },
-  {
-    "ran_at": "2026-10-29T13:04:59.408224+00:00",
     "triggered_by": "startup_scheduler",
     "evaluated": 121,
     "contaminated": 3,
